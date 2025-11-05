@@ -419,6 +419,21 @@ impl Room {
         Ok(())
     }
 
+    pub async fn send_state_event_raw(
+        &self,
+        event_type: &str,
+        state_key: &str,
+        content: String,
+    ) -> Result<(), ClientError> {
+        let content_json: serde_json::Value =
+            serde_json::from_str(&content).map_err(|e| ClientError::Generic {
+                msg: format!("Failed to parse JSON: {e}"),
+                details: Some(format!("{e:?}")),
+            })?;
+        self.inner.send_state_event_raw(event_type, state_key, content_json).await?;
+        Ok(())
+    }
+
     /// Redacts an event from the room.
     ///
     /// # Arguments
