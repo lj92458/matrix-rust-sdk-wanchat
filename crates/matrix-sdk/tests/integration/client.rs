@@ -1528,6 +1528,46 @@ async fn test_server_vendor_info() {
 }
 
 #[async_test]
+async fn test_server_version_without_auth() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    // If we provide an access token, we encounter a failure, likely because the
+    // token has expired.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/versions"))
+        .and(header("authorization", "Bearer 1234"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(server.server())
+        .await;
+
+    // If we do not provide an access token, all is fine as the endpoint does not
+    // require one.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/_matrix/client/versions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "versions": [
+                "r0.0.1",
+                "v1.1"
+            ]
+        })))
+        .mount(server.server())
+        .await;
+
+    let request_config = RequestConfig::new().disable_retry();
+    client
+        .fetch_server_versions(Some(request_config))
+        .await
+        .expect_err("We should fail here since we provided an auth token.");
+
+    let request_config = RequestConfig::new().disable_retry().skip_auth();
+    client
+        .fetch_server_versions(Some(request_config))
+        .await
+        .expect("We should not fail here since we did not provide an auth token.");
+}
+
+#[async_test]
 async fn test_server_vendor_info_with_missing_fields() {
     let server = MatrixMockServer::new().await;
     let client = server.client_builder().build().await;
@@ -1561,7 +1601,7 @@ async fn test_fetch_thread_subscriptions() {
         .match_to("to")
         .add_subscription(room1.clone(), thread1.clone(), ThreadSubscription::new(true, uint!(42)))
         .add_subscription(room2.clone(), thread2.clone(), ThreadSubscription::new(false, uint!(7)))
-        .add_unsubcription(room3.clone(), thread3.clone(), ThreadUnsubscription::new(uint!(13)))
+        .add_unsubscription(room3.clone(), thread3.clone(), ThreadUnsubscription::new(uint!(13)))
         .ok(Some("next_batch_token".to_owned()))
         .mount()
         .await;

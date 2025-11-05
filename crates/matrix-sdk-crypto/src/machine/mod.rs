@@ -897,7 +897,7 @@ impl OlmMachine {
         // This function is only ever called by add_room_key via
         // handle_decrypted_to_device_event, so sender, sender_key, and algorithm are
         // already recorded.
-        fields(room_id = ? content.room_id, session_id, message_index)
+        fields(room_id = ? content.room_id, session_id, message_index, shared_history = content.shared_history)
     )]
     async fn handle_key(
         &self,
@@ -1003,14 +1003,16 @@ impl OlmMachine {
 
         if let RoomKeyWithheldContent::MegolmV1AesSha2(
             MegolmV1AesSha2WithheldContent::BlackListed(c)
-            | MegolmV1AesSha2WithheldContent::Unverified(c),
+            | MegolmV1AesSha2WithheldContent::Unverified(c)
+            | MegolmV1AesSha2WithheldContent::Unauthorised(c)
+            | MegolmV1AesSha2WithheldContent::Unavailable(c),
         ) = &event.content
         {
             changes
                 .withheld_session_info
                 .entry(c.room_id.to_owned())
                 .or_default()
-                .insert(c.session_id.to_owned(), event.to_owned());
+                .insert(c.session_id.to_owned(), event.to_owned().into());
         }
     }
 
@@ -1292,6 +1294,15 @@ impl OlmMachine {
     /// Receive a verification event.
     ///
     /// The event should be in the decrypted form.
+    ///
+    /// **Note**: If the supplied event is an `m.room.message` event with
+    /// `msgtype: m.key.verification.request`, then the device information for
+    /// the sending user must be up-to-date before calling this method
+    /// (otherwise, the request will be ignored). It is hard to guarantee this
+    /// is the case, but you can maximize your chances by explicitly making a
+    /// request for this user's device info by calling
+    /// [`OlmMachine::query_keys_for_users`], sending the request, and
+    /// processing the response with [`OlmMachine::mark_request_as_sent`].
     pub async fn receive_verification_event(&self, event: &AnyMessageLikeEvent) -> StoreResult<()> {
         self.inner.verification_machine.receive_any_event(event).await
     }

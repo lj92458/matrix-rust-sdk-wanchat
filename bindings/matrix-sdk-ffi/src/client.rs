@@ -10,10 +10,13 @@ use anyhow::{anyhow, Context as _};
 use futures_util::pin_mut;
 #[cfg(not(target_family = "wasm"))]
 use matrix_sdk::media::MediaFileHandle as SdkMediaFileHandle;
+#[cfg(feature = "sqlite")]
+use matrix_sdk::STATE_STORE_DATABASE_NAME;
 use matrix_sdk::{
     authentication::oauth::{
         AccountManagementActionFull, ClientId, OAuthAuthorizationData, OAuthSession,
     },
+    deserialized_responses::RawAnySyncOrStrippedTimelineEvent,
     media::{MediaFormat, MediaRequestParameters, MediaRetentionPolicy, MediaThumbnailSettings},
     ruma::{
         api::client::{
@@ -39,7 +42,6 @@ use matrix_sdk::{
     sliding_sync::Version as SdkSlidingSyncVersion,
     store::RoomLoadSettings as SdkRoomLoadSettings,
     Account, AuthApi, AuthSession, Client as MatrixClient, Error, SessionChange, SessionTokens,
-    STATE_STORE_DATABASE_NAME,
 };
 use matrix_sdk_common::{stream::StreamExt, SendOutsideWasm, SyncOutsideWasm};
 use matrix_sdk_ui::{
@@ -100,10 +102,10 @@ use crate::{
     authentication::{HomeserverLoginDetails, OidcConfiguration, OidcError, SsoError, SsoHandler},
     client,
     encryption::Encryption,
-    notification::NotificationClient,
+    notification::{NotificationClient, NotificationEvent},
     notification_settings::NotificationSettings,
-    qr_code::{HumanQrLoginError, QrCodeData, QrLoginProgressListener},
-    room::{RoomHistoryVisibility, RoomInfoListener},
+    qr_code::LoginWithQrCodeHandler,
+    room::{RoomHistoryVisibility, RoomInfoListener, RoomSendQueueUpdate},
     room_directory_search::RoomDirectorySearch,
     room_preview::RoomPreview,
     ruma::{
@@ -195,6 +197,13 @@ pub trait ProgressWatcher: SyncOutsideWasm + SendOutsideWasm {
     fn transmission_progress(&self, progress: TransmissionProgress);
 }
 
+/// A listener to the global (client-wide) update reporter of the send queue.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait SendQueueRoomUpdateListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called every time the send queue emits an update for a given room.
+    fn on_update(&self, room_id: String, update: RoomSendQueueUpdate);
+}
+
 /// A listener to the global (client-wide) error reporter of the send queue.
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait SendQueueRoomErrorListener: SyncOutsideWasm + SendOutsideWasm {
@@ -217,6 +226,25 @@ pub trait RoomAccountDataListener: SyncOutsideWasm + SendOutsideWasm {
     fn on_change(&self, event: RoomAccountDataEvent, room_id: String);
 }
 
+/// A listener for notifications generated from sync responses.
+///
+/// This is called during sync for each event that triggers a notification
+/// based on the user's push rules.
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait SyncNotificationListener: SyncOutsideWasm + SendOutsideWasm {
+    /// Called when a notifying event is received during sync.
+    fn on_notification(&self, notification: SyncNotification, room_id: String);
+}
+
+/// A notification generated from a sync response.
+#[derive(uniffi::Record)]
+pub struct SyncNotification {
+    /// The push actions for this notification (notify, sound, highlight, etc.)
+    pub actions: Vec<crate::notification_settings::Action>,
+    /// The event that triggered the notification
+    pub event: NotificationEvent,
+}
+
 #[derive(Clone, Copy, uniffi::Record)]
 pub struct TransmissionProgress {
     pub current: u64,
@@ -235,13 +263,18 @@ impl From<matrix_sdk::TransmissionProgress> for TransmissionProgress {
 #[derive(uniffi::Object)]
 pub struct Client {
     pub(crate) inner: AsyncRuntimeDropped<MatrixClient>,
+
     delegate: OnceLock<Arc<dyn ClientDelegate>>,
+
     pub(crate) utd_hook_manager: OnceLock<Arc<UtdHookManager>>,
+
     session_verification_controller:
         Arc<tokio::sync::RwLock<Option<SessionVerificationController>>>,
+
     /// The path to the directory where the state store and the crypto store are
-    /// located, if the `Client` instance has been built with a SQLite store
-    /// backend.
+    /// located, if the `Client` instance has been built with a store (either
+    /// SQLite or IndexedDB).
+    #[cfg_attr(not(feature = "sqlite"), allow(unused))]
     store_path: Option<PathBuf>,
 }
 
@@ -543,43 +576,17 @@ impl Client {
         Ok(())
     }
 
-    /// Log in using the provided [`QrCodeData`]. The `Client` must be built
-    /// by providing [`QrCodeData::server_name`] as the server name for this
-    /// login to succeed.
+    /// Log in using a QR code.
     ///
-    /// This method uses the login mechanism described in [MSC4108]. As such
-    /// this method requires OAuth 2.0 support as well as sliding sync support.
+    /// # Arguments
     ///
-    /// The usage of the progress_listener is required to transfer the
-    /// [`CheckCode`] to the existing client.
-    ///
-    /// [MSC4108]: https://github.com/matrix-org/matrix-spec-proposals/pull/4108
-    pub async fn login_with_qr_code(
+    /// * `oidc_configuration` - The data to restore or register the client with
+    ///   the server.
+    pub fn login_with_qr_code(
         self: Arc<Self>,
-        qr_code_data: &QrCodeData,
-        oidc_configuration: &OidcConfiguration,
-        progress_listener: Box<dyn QrLoginProgressListener>,
-    ) -> Result<(), HumanQrLoginError> {
-        let registration_data = oidc_configuration
-            .registration_data()
-            .map_err(|_| HumanQrLoginError::OidcMetadataInvalid)?;
-
-        let oauth = self.inner.oauth();
-        let login = oauth.login_with_qr_code(&qr_code_data.inner, Some(&registration_data));
-
-        let mut progress = login.subscribe_to_progress();
-
-        // We create this task, which will get cancelled once it's dropped, just in case
-        // the progress stream doesn't end.
-        let _progress_task = TaskHandle::new(get_runtime_handle().spawn(async move {
-            while let Some(state) = progress.next().await {
-                progress_listener.on_update(state.into());
-            }
-        }));
-
-        login.await?;
-
-        Ok(())
+        oidc_configuration: OidcConfiguration,
+    ) -> LoginWithQrCodeHandler {
+        LoginWithQrCodeHandler::new(self.inner.oauth(), oidc_configuration)
     }
 
     /// Restores the client from a `Session`.
@@ -631,6 +638,49 @@ impl Client {
     /// queue.
     pub fn enable_send_queue_upload_progress(&self, enable: bool) {
         self.inner.send_queue().enable_upload_progress(enable);
+    }
+
+    /// Subscribe to the global send queue update reporter, at the
+    /// client-wide level.
+    ///
+    /// The given listener will be immediately called with
+    /// `RoomSendQueueUpdate::NewLocalEvent` for each local echo existing in
+    /// the queue.
+    pub async fn subscribe_to_send_queue_updates(
+        &self,
+        listener: Box<dyn SendQueueRoomUpdateListener>,
+    ) -> Result<Arc<TaskHandle>, ClientError> {
+        let q = self.inner.send_queue();
+        let local_echoes = q.local_echoes().await?;
+        let mut subscriber = q.subscribe();
+
+        for (room_id, local_echoes) in local_echoes {
+            for local_echo in local_echoes {
+                listener.on_update(
+                    room_id.clone().into(),
+                    RoomSendQueueUpdate::NewLocalEvent {
+                        transaction_id: local_echo.transaction_id.into(),
+                    },
+                );
+            }
+        }
+
+        Ok(Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            loop {
+                match subscriber.recv().await {
+                    Ok(update) => {
+                        let room_id = update.room_id.to_string();
+                        match update.update.try_into() {
+                            Ok(update) => listener.on_update(room_id, update),
+                            Err(err) => error!("error when converting send queue update: {err}"),
+                        }
+                    }
+                    Err(err) => {
+                        error!("error when listening to the send queue update reporter: {err}");
+                    }
+                }
+            }
+        }))))
     }
 
     /// Subscribe to the global enablement status of the send queue, at the
@@ -786,6 +836,66 @@ impl Client {
                 observe!(UnstableMarkedUnreadEventContent)
             }
         }
+    }
+
+    /// Register a handler for notifications generated from sync responses.
+    ///
+    /// The handler will be called during sync for each event that triggers
+    /// a notification based on the user's push rules.
+    ///
+    /// The handler receives:
+    /// - The notification with push actions and event data
+    /// - The room ID where the notification occurred
+    ///
+    /// This is useful for implementing custom notification logic, such as
+    /// displaying local notifications or updating notification badges.
+    pub async fn register_notification_handler(&self, listener: Box<dyn SyncNotificationListener>) {
+        let listener = Arc::new(listener);
+        self.inner
+            .register_notification_handler(move |notification, room, _client| {
+                let listener = listener.clone();
+                let room_id = room.room_id().to_string();
+
+                async move {
+                    // Convert SDK actions to FFI type
+                    let actions: Vec<crate::notification_settings::Action> = notification
+                        .actions
+                        .into_iter()
+                        .filter_map(|action| action.try_into().ok())
+                        .collect();
+
+                    // Convert SDK event to FFI type
+                    let event = match notification.event {
+                        RawAnySyncOrStrippedTimelineEvent::Sync(raw) => match raw.deserialize() {
+                            Ok(deserialized) => NotificationEvent::Timeline {
+                                event: Arc::new(crate::event::TimelineEvent(Box::new(
+                                    deserialized,
+                                ))),
+                            },
+                            Err(err) => {
+                                tracing::warn!("Failed to deserialize timeline event: {err}");
+                                return;
+                            }
+                        },
+                        RawAnySyncOrStrippedTimelineEvent::Stripped(raw) => {
+                            match raw.deserialize() {
+                                Ok(deserialized) => NotificationEvent::Invite {
+                                    sender: deserialized.sender().to_string(),
+                                },
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Failed to deserialize stripped state event: {err}"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    listener.on_notification(SyncNotification { actions, event }, room_id);
+                }
+            })
+            .await;
     }
 
     /// Allows generic GET requests to be made through the SDK's internal HTTP
@@ -1573,6 +1683,7 @@ impl Client {
             self.inner.event_cache().clear_all_rooms().await?;
 
             // Delete the state store file, if it exists.
+            #[cfg(feature = "sqlite")]
             if let Some(store_path) = &self.store_path {
                 debug!("Removing the state store: {}", store_path.display());
 
@@ -2083,24 +2194,24 @@ impl TryFrom<CreateRoomParameters> for create_room::v3::Request {
         if value.is_encrypted {
             let content =
                 RoomEncryptionEventContent::new(EventEncryptionAlgorithm::MegolmV1AesSha2);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(url) = value.avatar {
             let mut content = RoomAvatarEventContent::new();
             content.url = Some(url.into());
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(join_rule_override) = value.join_rule_override {
             let content = RoomJoinRulesEventContent::new(join_rule_override.try_into()?);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         if let Some(history_visibility_override) = value.history_visibility_override {
             let content =
                 RoomHistoryVisibilityEventContent::new(history_visibility_override.try_into()?);
-            initial_state.push(InitialStateEvent::new(content).to_raw_any());
+            initial_state.push(InitialStateEvent::with_empty_state_key(content).to_raw_any());
         }
 
         request.initial_state = initial_state;

@@ -25,13 +25,18 @@ experimental-encrypted-state-events = [
 ]
 
 [dependencies]
-anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+futures-util.workspace = true
 gloo-utils = { version = "0.2.0", features = ["serde"] }
 growable-bloom-filter = { workspace = true, optional = true }
 hkdf.workspace = true
-indexed_db_futures = "0.5.0"
+indexed_db_futures = { workspace = true, features = [
+    "serde",
+    "cursors",
+    "indices",
+    "streams",
+]}
 js-sys.workspace = true
 matrix-sdk-base = { workspace = true, features = ["js"], optional = true }
 matrix-sdk-crypto = { workspace = true, features = ["js"], optional = true }
@@ -45,6 +50,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["js", "serde", "v4"] }
 wasm-bindgen.workspace = true
 web-sys = { workspace = true, features = ["IdbKeyRange"] }
 zeroize.workspace = true
@@ -66,7 +72,6 @@ tracing-subscriber = { workspace = true, features = [
     "registry",
     "tracing-log",
 ] }
-uuid.workspace = true
 wasm-bindgen-test.workspace = true
 web-sys = { workspace = true, features = [
     "IdbKeyRange",

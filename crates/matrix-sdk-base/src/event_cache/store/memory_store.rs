@@ -28,9 +28,7 @@ use matrix_sdk_common::{
 use ruma::{EventId, OwnedEventId, RoomId, events::relation::RelationType, time::Instant};
 use tracing::error;
 
-use super::{
-    EventCacheStore, EventCacheStoreError, Result, compute_filters_string, extract_event_relation,
-};
+use super::{EventCacheStore, EventCacheStoreError, Result, extract_event_relation};
 use crate::event_cache::{Event, Gap};
 
 /// In-memory, non-persistent implementation of the `EventCacheStore`.
@@ -194,14 +192,13 @@ impl EventCacheStore for MemoryStore {
     ) -> Result<Vec<(Event, Option<Position>)>, Self::Error> {
         let inner = self.inner.read().unwrap();
 
-        let filters = compute_filters_string(filters);
-
         let related_events = inner
             .events
             .items(room_id)
             .filter_map(|(event, pos)| {
                 // Must have a relation.
                 let (related_to, rel_type) = extract_event_relation(event.raw())?;
+                let rel_type = RelationType::from(rel_type.as_str());
 
                 // Must relate to the target item.
                 if related_to != event_id {
@@ -220,11 +217,24 @@ impl EventCacheStore for MemoryStore {
         Ok(related_events)
     }
 
-    async fn get_room_events(&self, room_id: &RoomId) -> Result<Vec<Event>, Self::Error> {
+    async fn get_room_events(
+        &self,
+        room_id: &RoomId,
+        event_type: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Event>, Self::Error> {
         let inner = self.inner.read().unwrap();
 
-        let event: Vec<_> =
-            inner.events.items(room_id).map(|(event, _pos)| event.clone()).collect();
+        let event: Vec<_> = inner
+            .events
+            .items(room_id)
+            .map(|(event, _pos)| event.clone())
+            .filter(|e| {
+                event_type
+                    .is_none_or(|event_type| Some(event_type) == e.kind.event_type().as_deref())
+            })
+            .filter(|e| session_id.is_none_or(|s| Some(s) == e.kind.session_id()))
+            .collect();
 
         Ok(event)
     }
@@ -240,6 +250,7 @@ impl EventCacheStore for MemoryStore {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)] // There seems to be a false positive when importing the test macros.
 mod tests {
     use super::{MemoryStore, Result};
     use crate::{event_cache_store_integration_tests, event_cache_store_integration_tests_time};

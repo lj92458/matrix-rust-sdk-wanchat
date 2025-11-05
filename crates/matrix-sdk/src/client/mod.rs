@@ -45,12 +45,13 @@ use ruma::{
     DeviceId, OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedServerName,
     RoomAliasId, RoomId, RoomOrAliasId, ServerName, UInt, UserId,
     api::{
-        FeatureFlag, MatrixVersion, OutgoingRequest, SupportedVersions,
+        FeatureFlag, MatrixVersion, Metadata, OutgoingRequest, SupportedVersions,
+        auth_scheme::{AuthScheme, SendAccessToken},
         client::{
             account::whoami,
             alias::{create_alias, delete_alias, get_alias},
             authenticated_media,
-            device::{delete_devices, get_devices, update_device},
+            device::{self, delete_devices, get_devices, update_device},
             directory::{get_public_rooms, get_public_rooms_filtered},
             discovery::{
                 discover_homeserver::{self, RtcFocusInfo},
@@ -71,8 +72,10 @@ use ruma::{
         },
         error::FromHttpResponseError,
         federation::discovery::get_server_version,
+        path_builder::PathBuilder,
     },
     assign,
+    events::direct::DirectUserIdentifier,
     push::Ruleset,
     time::Instant,
 };
@@ -98,7 +101,7 @@ use crate::{
         EventHandler, EventHandlerContext, EventHandlerDropGuard, EventHandlerHandle,
         EventHandlerStore, ObservableEventHandler, SyncEvent,
     },
-    http_client::HttpClient,
+    http_client::{HttpClient, SupportedPathBuilder},
     latest_events::LatestEvents,
     media::MediaError,
     notification_settings::NotificationSettings,
@@ -533,6 +536,22 @@ impl Client {
         *self.inner.homeserver.write().unwrap() = homeserver_url;
     }
 
+    /// Change to a different homeserver and re-resolve well-known.
+    #[cfg(feature = "e2e-encryption")]
+    pub(crate) async fn switch_homeserver_and_re_resolve_well_known(
+        &self,
+        homeserver_url: Url,
+    ) -> Result<()> {
+        self.set_homeserver(homeserver_url);
+        self.reset_server_info().await?;
+        if let ServerInfo { well_known: Some(well_known), .. } =
+            self.load_or_fetch_server_info().await?
+        {
+            self.set_homeserver(Url::parse(&well_known.homeserver.base_url)?);
+        }
+        Ok(())
+    }
+
     /// Get the capabilities of the homeserver.
     ///
     /// This method should be used to check what features are supported by the
@@ -818,7 +837,11 @@ impl Client {
     ///         events::{
     ///             macros::EventContent,
     ///             push_rules::PushRulesEvent,
-    ///             room::{message::SyncRoomMessageEvent, topic::SyncRoomTopicEvent},
+    ///             room::{
+    ///                 message::SyncRoomMessageEvent,
+    ///                 topic::SyncRoomTopicEvent,
+    ///                 member::{StrippedRoomMemberEvent, SyncRoomMemberEvent},
+    ///             },
     ///         },
     ///         push::Action,
     ///         Int, MilliSecondsSinceUnixEpoch,
@@ -870,6 +893,18 @@ impl Client {
     /// client.add_event_handler(|ev: SyncRoomMessageEvent, context: Ctx<MyContext>| async move {
     ///     // Use the context
     /// });
+    ///
+    /// // This will handle membership events in joined rooms. Invites are special, see below.
+    /// client.add_event_handler(
+    ///     |ev: SyncRoomMemberEvent| async move {},
+    /// );
+    ///
+    /// // To handle state events in invited rooms (including invite membership events),
+    /// // `StrippedRoomMemberEvent` should be used.
+    /// // https://spec.matrix.org/v1.16/client-server-api/#stripped-state
+    /// client.add_event_handler(
+    ///     |ev: StrippedRoomMemberEvent| async move {},
+    /// );
     ///
     /// // Custom events work exactly the same way, you just need to declare
     /// // the content struct and use the EventContent derive macro on it.
@@ -1749,8 +1784,10 @@ impl Client {
     pub async fn create_dm(&self, user_id: &UserId) -> Result<Room> {
         #[cfg(feature = "e2e-encryption")]
         let initial_state = vec![
-            InitialStateEvent::new(RoomEncryptionEventContent::with_recommended_defaults())
-                .to_raw_any(),
+            InitialStateEvent::with_empty_state_key(
+                RoomEncryptionEventContent::with_recommended_defaults(),
+            )
+            .to_raw_any(),
         ];
 
         #[cfg(not(feature = "e2e-encryption"))]
@@ -1764,6 +1801,20 @@ impl Client {
         });
 
         self.create_room(request).await
+    }
+
+    /// Get the existing DM room with the given user, if any.
+    pub fn get_dm_room(&self, user_id: &UserId) -> Option<Room> {
+        let rooms = self.joined_rooms();
+
+        // Find the room we share with the `user_id` and only with `user_id`
+        let room = rooms.into_iter().find(|r| {
+            let targets = r.direct_targets();
+            targets.len() == 1 && targets.contains(<&DirectUserIdentifier>::from(user_id))
+        });
+
+        trace!(?user_id, ?room, "Found DM room with user");
+        room
     }
 
     /// Search the homeserver's directory for public rooms with a filter.
@@ -1845,6 +1896,9 @@ impl Client {
     pub fn send<Request>(&self, request: Request) -> SendRequest<Request>
     where
         Request: OutgoingRequest + Clone + Debug,
+        for<'a> Request::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
+        Request::PathBuilder: SupportedPathBuilder,
+        for<'a> <Request::PathBuilder as PathBuilder>::Input<'a>: SendOutsideWasm + SyncOutsideWasm,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
         SendRequest {
@@ -1863,10 +1917,17 @@ impl Client {
     ) -> HttpResult<Request::IncomingResponse>
     where
         Request: OutgoingRequest + Debug,
+        for<'a> Request::Authentication: AuthScheme<Input<'a> = SendAccessToken<'a>>,
+        Request::PathBuilder: SupportedPathBuilder,
+        for<'a> <Request::PathBuilder as PathBuilder>::Input<'a>: SendOutsideWasm + SyncOutsideWasm,
         HttpError: From<FromHttpResponseError<Request::EndpointError>>,
     {
         let homeserver = self.homeserver().to_string();
         let access_token = self.access_token();
+        let skip_auth = config.map(|c| c.skip_auth).unwrap_or(self.request_config().skip_auth);
+
+        let path_builder_input =
+            Request::PathBuilder::get_path_builder_input(self, skip_auth).await?;
 
         self.inner
             .http_client
@@ -1875,7 +1936,7 @@ impl Client {
                 config,
                 homeserver,
                 access_token.as_deref(),
-                &self.supported_versions().await?,
+                path_builder_input,
                 send_progress,
             )
             .await
@@ -1895,19 +1956,7 @@ impl Client {
         request_config: Option<RequestConfig>,
     ) -> HttpResult<get_supported_versions::Response> {
         let server_versions = self
-            .inner
-            .http_client
-            .send(
-                get_supported_versions::Request::new(),
-                request_config,
-                self.homeserver().to_string(),
-                None,
-                &SupportedVersions {
-                    versions: [MatrixVersion::V1_0].into(),
-                    features: Default::default(),
-                },
-                Default::default(),
-            )
+            .send_inner(get_supported_versions::Request::new(), request_config, Default::default())
             .await?;
 
         Ok(server_versions)
@@ -1932,10 +1981,7 @@ impl Client {
                 Some(RequestConfig::short_retry()),
                 server_url_string,
                 None,
-                &SupportedVersions {
-                    versions: [MatrixVersion::V1_0].into(),
-                    features: Default::default(),
-                },
+                (),
                 Default::default(),
             )
             .await;
@@ -1994,6 +2040,16 @@ impl Client {
         }
 
         Ok(server_info)
+    }
+
+    pub(crate) async fn get_cached_versions(&self) -> Option<SupportedVersions> {
+        let server_info = &self.inner.caches.server_info;
+
+        if let CachedValue::Cached(val) = &server_info.read().await.supported_versions {
+            Some(val.clone())
+        } else {
+            None
+        }
     }
 
     async fn get_or_load_and_cache_server_info<
@@ -2268,6 +2324,30 @@ impl Client {
         request.display_name = Some(display_name.to_owned());
 
         self.send(request).await
+    }
+
+    /// Check whether a device with a specific ID exists on the server.
+    ///
+    /// Returns Ok(true) if the device exists, Ok(false) if the server responded
+    /// with 404 and the underlying error otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_id` - The ID of the device to query.
+    pub async fn device_exists(&self, device_id: OwnedDeviceId) -> Result<bool> {
+        let request = device::get_device::v3::Request::new(device_id);
+        match self.send(request).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                if let Some(error) = err.as_client_api_error()
+                    && error.status_code == 404
+                {
+                    Ok(false)
+                } else {
+                    Err(err.into())
+                }
+            }
+        }
     }
 
     /// Synchronize the client's state with the latest state on the server.
@@ -2874,8 +2954,8 @@ impl Client {
 
         // Use the authenticated endpoint when the server supports it.
         let supported_versions = self.supported_versions().await?;
-        let use_auth =
-            authenticated_media::get_media_config::v1::Request::is_supported(&supported_versions);
+        let use_auth = authenticated_media::get_media_config::v1::Request::PATH_BUILDER
+            .is_supported(&supported_versions);
 
         let upload_size = if use_auth {
             self.send(authenticated_media::get_media_config::v1::Request::default())
@@ -3086,7 +3166,7 @@ pub(crate) mod tests {
             ignored_user_list::IgnoredUserListEventContent,
             media_preview_config::{InviteAvatars, MediaPreviewConfigEventContent, MediaPreviews},
         },
-        owned_room_id, owned_user_id, room_alias_id, room_id,
+        owned_device_id, owned_room_id, owned_user_id, room_alias_id, room_id, user_id,
     };
     use serde_json::json;
     use stream_assert::{assert_next_matches, assert_pending};
@@ -4075,5 +4155,112 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[async_test]
+    async fn test_get_dm_room_returns_the_room_we_have_with_this_user() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        // This is the user ID that is inside MemberAdditional.
+        // Note the confusing username, so we can share
+        // GlobalAccountDataTestEvent::Direct with the invited test.
+        let user_id = user_id!("@invited:localhost");
+
+        // When we receive a sync response saying "invited" is invited to a DM
+        let f = EventFactory::new();
+        let response = SyncResponseBuilder::default()
+            .add_joined_room(
+                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberAdditional),
+            )
+            .add_global_account_data(
+                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
+            )
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+
+        // Then get_dm_room finds this room
+        let found_room = client.get_dm_room(user_id).expect("DM not found!");
+        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
+    }
+
+    #[async_test]
+    async fn test_get_dm_room_still_finds_room_where_participant_is_only_invited() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        // This is the user ID that is inside MemberInvite
+        let user_id = user_id!("@invited:localhost");
+
+        // When we receive a sync response saying "invited" is invited to a DM
+        let f = EventFactory::new();
+        let response = SyncResponseBuilder::default()
+            .add_joined_room(
+                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberInvite),
+            )
+            .add_global_account_data(
+                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
+            )
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+
+        // Then get_dm_room finds this room
+        let found_room = client.get_dm_room(user_id).expect("DM not found!");
+        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
+    }
+
+    #[async_test]
+    async fn test_get_dm_room_still_finds_left_room() {
+        // See the discussion in https://github.com/matrix-org/matrix-rust-sdk/issues/2017
+        // and the high-level issue at https://github.com/vector-im/element-x-ios/issues/1077
+
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        // This is the user ID that is inside MemberAdditional.
+        // Note the confusing username, so we can share
+        // GlobalAccountDataTestEvent::Direct with the invited test.
+        let user_id = user_id!("@invited:localhost");
+
+        // When we receive a sync response saying "invited" is invited to a DM
+        let f = EventFactory::new();
+        let response = SyncResponseBuilder::default()
+            .add_joined_room(
+                JoinedRoomBuilder::default().add_state_event(StateTestEvent::MemberLeave),
+            )
+            .add_global_account_data(
+                f.direct().add_user(user_id.to_owned().into(), *DEFAULT_TEST_ROOM_ID),
+            )
+            .build_sync_response();
+        client.base_client().receive_sync_response(response).await.unwrap();
+
+        // Then get_dm_room finds this room
+        let found_room = client.get_dm_room(user_id).expect("DM not found!");
+        assert!(found_room.get_member_no_sync(user_id).await.unwrap().is_some());
+    }
+
+    #[async_test]
+    async fn test_device_exists() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_get_device().ok().expect(1).mount().await;
+
+        assert_matches!(client.device_exists(owned_device_id!("ABCDEF")).await, Ok(true));
+    }
+
+    #[async_test]
+    async fn test_device_exists_404() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        assert_matches!(client.device_exists(owned_device_id!("ABCDEF")).await, Ok(false));
+    }
+
+    #[async_test]
+    async fn test_device_exists_500() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_get_device().error500().expect(1).mount().await;
+
+        assert_matches!(client.device_exists(owned_device_id!("ABCDEF")).await, Err(_));
     }
 }

@@ -16,15 +16,14 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_debug_implementations, missing_docs)]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub use async_trait::async_trait;
 pub use bytes;
-#[cfg(feature = "e2e-encryption")]
-pub use matrix_sdk_base::crypto;
 pub use matrix_sdk_base::{
-    ComposerDraft, ComposerDraftType, EncryptionState, PredecessorRoom, QueueWedgeError,
-    Room as BaseRoom, RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
+    ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent, DraftThumbnail,
+    EncryptionState, PredecessorRoom, QueueWedgeError, Room as BaseRoom,
+    RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomInfo,
     RoomMember as BaseRoomMember, RoomMemberships, RoomRecencyStamp, RoomState, SessionMeta,
     StateChanges, StateStore, StoreError, SuccessorRoom, ThreadingSupport, deserialized_responses,
     store::{self, DynStateStore, MemoryStore, StateStoreExt},

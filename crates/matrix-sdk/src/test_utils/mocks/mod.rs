@@ -35,6 +35,7 @@ use ruma::{
     DeviceId, EventId, MilliSecondsSinceUnixEpoch, MxcUri, OwnedDeviceId, OwnedEventId,
     OwnedOneTimeKeyId, OwnedRoomId, OwnedUserId, RoomId, ServerName, UserId,
     api::client::{
+        profile::{ProfileFieldName, ProfileFieldValue},
         receipt::create_receipt::v3::ReceiptType,
         room::Visibility,
         sync::sync_events::v5,
@@ -55,7 +56,7 @@ use ruma::{
     serde::Raw,
     time::Duration,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, from_value, json};
 use tokio::sync::oneshot::{self, Receiver};
 use wiremock::{
@@ -1245,6 +1246,131 @@ impl MatrixMockServer {
         self.mock_endpoint(mock, UpdateRecentEmojisEndpoint::new()).expect_default_access_token()
     }
 
+    /// Create a prebuilt mock for the endpoint used to get the default secret
+    /// storage key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// tokio_test::block_on(async {
+    /// use js_int::uint;
+    /// use matrix_sdk::{
+    ///     encryption::secret_storage::SecretStorage,
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_get_default_secret_storage_key().ok(
+    ///     client.user_id().unwrap(),
+    ///     "abc", // key ID of default secret storage key
+    /// )
+    ///     .mount()
+    ///     .await;
+    ///
+    /// client.encryption()
+    ///     .secret_storage()
+    ///     .fetch_default_key_id()
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// # anyhow::Ok(()) });
+    /// ```
+    #[cfg(feature = "e2e-encryption")]
+    pub fn mock_get_default_secret_storage_key(
+        &self,
+    ) -> MockEndpoint<'_, GetDefaultSecretStorageKeyEndpoint> {
+        let mock = Mock::given(method("GET"));
+        self.mock_endpoint(mock, GetDefaultSecretStorageKeyEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get a secret storage
+    /// key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// tokio_test::block_on(async {
+    /// use js_int::uint;
+    /// use ruma::events::secret_storage::key;
+    /// use ruma::serde::Base64;
+    /// use matrix_sdk::{
+    ///     encryption::secret_storage::SecretStorage,
+    ///     test_utils::mocks::MatrixMockServer,
+    /// };
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_get_default_secret_storage_key().ok(
+    ///     client.user_id().unwrap(),
+    ///     "abc",
+    /// )
+    ///     .mount()
+    ///     .await;
+    /// mock_server.mock_get_secret_storage_key().ok(
+    ///     client.user_id().unwrap(),
+    ///     &key::SecretStorageKeyEventContent::new(
+    ///         "abc".into(),
+    ///         key::SecretStorageEncryptionAlgorithm::V1AesHmacSha2(key::SecretStorageV1AesHmacSha2Properties::new(
+    ///             Some(Base64::parse("xv5b6/p3ExEw++wTyfSHEg==").unwrap()),
+    ///             Some(Base64::parse("ujBBbXahnTAMkmPUX2/0+VTfUh63pGyVRuBcDMgmJC8=").unwrap()),
+    ///         )),
+    ///     ),
+    /// )
+    ///     .mount()
+    ///     .await;
+    ///
+    /// client.encryption()
+    ///     .secret_storage()
+    ///     .open_secret_store("EsTj 3yST y93F SLpB jJsz eAXc 2XzA ygD3 w69H fGaN TKBj jXEd")
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// # anyhow::Ok(()) });
+    /// ```
+    #[cfg(feature = "e2e-encryption")]
+    pub fn mock_get_secret_storage_key(&self) -> MockEndpoint<'_, GetSecretStorageKeyEndpoint> {
+        let mock = Mock::given(method("GET"));
+        self.mock_endpoint(mock, GetSecretStorageKeyEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get the default secret
+    /// storage key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// tokio_test::block_on(async {
+    /// use js_int::uint;
+    /// use serde_json::json;
+    /// use ruma::events::GlobalAccountDataEventType;
+    /// use matrix_sdk::test_utils::mocks::MatrixMockServer;
+    ///
+    /// let mock_server = MatrixMockServer::new().await;
+    /// let client = mock_server.client_builder().build().await;
+    ///
+    /// mock_server.mock_get_master_signing_key().ok(
+    ///     client.user_id().unwrap(),
+    ///     json!({})
+    /// )
+    /// .mount()
+    /// .await;
+    ///
+    /// client.account()
+    ///     .fetch_account_data(GlobalAccountDataEventType::from("m.cross_signing.master".to_owned()))
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// # anyhow::Ok(()) });
+    /// ```
+    #[cfg(feature = "e2e-encryption")]
+    pub fn mock_get_master_signing_key(&self) -> MockEndpoint<'_, GetMasterSigningKeyEndpoint> {
+        let mock = Mock::given(method("GET"));
+        self.mock_endpoint(mock, GetMasterSigningKeyEndpoint).expect_default_access_token()
+    }
+
     /// Create a prebuilt mock for the endpoint used to send a single receipt.
     pub fn mock_send_receipt(
         &self,
@@ -1300,6 +1426,12 @@ impl MatrixMockServer {
     pub fn mock_devices(&self) -> MockEndpoint<'_, DevicesEndpoint> {
         let mock = Mock::given(method("GET")).and(path("/_matrix/client/v3/devices"));
         self.mock_endpoint(mock, DevicesEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to query a single device.
+    pub fn mock_get_device(&self) -> MockEndpoint<'_, GetDeviceEndpoint> {
+        let mock = Mock::given(method("GET")).and(path_regex("/_matrix/client/v3/devices/.*"));
+        self.mock_endpoint(mock, GetDeviceEndpoint).expect_default_access_token()
     }
 
     /// Create a prebuilt mock for the endpoint used to search in the user
@@ -1496,6 +1628,46 @@ impl MatrixMockServer {
         let mock =
             Mock::given(method("GET")).and(path_regex(r"^/_matrix/client/v1/rooms/.*/hierarchy"));
         self.mock_endpoint(mock, GetHierarchyEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get a profile field.
+    pub fn mock_get_profile_field(
+        &self,
+        user_id: &UserId,
+        field: ProfileFieldName,
+    ) -> MockEndpoint<'_, GetProfileFieldEndpoint> {
+        let mock = Mock::given(method("GET"))
+            .and(path(format!("/_matrix/client/v3/profile/{user_id}/{field}")));
+        self.mock_endpoint(mock, GetProfileFieldEndpoint { field })
+    }
+
+    /// Create a prebuilt mock for the endpoint used to set a profile field.
+    pub fn mock_set_profile_field(
+        &self,
+        user_id: &UserId,
+        field: ProfileFieldName,
+    ) -> MockEndpoint<'_, SetProfileFieldEndpoint> {
+        let mock = Mock::given(method("PUT"))
+            .and(path(format!("/_matrix/client/v3/profile/{user_id}/{field}")));
+        self.mock_endpoint(mock, SetProfileFieldEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to delete a profile field.
+    pub fn mock_delete_profile_field(
+        &self,
+        user_id: &UserId,
+        field: ProfileFieldName,
+    ) -> MockEndpoint<'_, DeleteProfileFieldEndpoint> {
+        let mock = Mock::given(method("DELETE"))
+            .and(path(format!("/_matrix/client/v3/profile/{user_id}/{field}")));
+        self.mock_endpoint(mock, DeleteProfileFieldEndpoint).expect_default_access_token()
+    }
+
+    /// Create a prebuilt mock for the endpoint used to get a profile.
+    pub fn mock_get_profile(&self, user_id: &UserId) -> MockEndpoint<'_, GetProfileEndpoint> {
+        let mock =
+            Mock::given(method("GET")).and(path(format!("/_matrix/client/v3/profile/{user_id}")));
+        self.mock_endpoint(mock, GetProfileEndpoint)
     }
 }
 
@@ -3623,6 +3795,74 @@ impl<'a> MockEndpoint<'a, UpdateRecentEmojisEndpoint> {
     }
 }
 
+/// A prebuilt mock for a `GET
+/// /_matrix/client/v3/user/{userId}/account_data/m.secret_storage.default_key`
+/// request, which fetches the ID of the default secret storage key.
+#[cfg(feature = "e2e-encryption")]
+pub struct GetDefaultSecretStorageKeyEndpoint;
+
+#[cfg(feature = "e2e-encryption")]
+impl<'a> MockEndpoint<'a, GetDefaultSecretStorageKeyEndpoint> {
+    /// Returns a mock for a successful fetch of the default secret storage key.
+    pub fn ok(self, user_id: &UserId, key_id: &str) -> MatrixMock<'a> {
+        let mock = global_account_data_mock_builder(
+            self.mock,
+            user_id,
+            GlobalAccountDataEventType::SecretStorageDefaultKey,
+        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key": key_id
+        })));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for a `GET
+/// /_matrix/client/v3/user/{userId}/account_data/m.secret_storage.key.{keyId}`
+/// request, which fetches information about a secret storage key.
+#[cfg(feature = "e2e-encryption")]
+pub struct GetSecretStorageKeyEndpoint;
+
+#[cfg(feature = "e2e-encryption")]
+impl<'a> MockEndpoint<'a, GetSecretStorageKeyEndpoint> {
+    /// Returns a mock for a successful fetch of the secret storage key
+    pub fn ok(
+        self,
+        user_id: &UserId,
+        secret_storage_key_event_content: &ruma::events::secret_storage::key::SecretStorageKeyEventContent,
+    ) -> MatrixMock<'a> {
+        let mock = global_account_data_mock_builder(
+            self.mock,
+            user_id,
+            GlobalAccountDataEventType::SecretStorageKey(
+                secret_storage_key_event_content.key_id.clone(),
+            ),
+        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(secret_storage_key_event_content));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
+/// A prebuilt mock for a `GET
+/// /_matrix/client/v3/user/{userId}/account_data/m.cross_signing.master`
+/// request, which fetches information about the master signing key.
+#[cfg(feature = "e2e-encryption")]
+pub struct GetMasterSigningKeyEndpoint;
+
+#[cfg(feature = "e2e-encryption")]
+impl<'a> MockEndpoint<'a, GetMasterSigningKeyEndpoint> {
+    /// Returns a mock for a successful fetch of the master signing key
+    pub fn ok<B: Serialize>(self, user_id: &UserId, key_json: B) -> MatrixMock<'a> {
+        let mock = global_account_data_mock_builder(
+            self.mock,
+            user_id,
+            GlobalAccountDataEventType::from("m.cross_signing.master".to_owned()),
+        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(key_json));
+        MatrixMock { server: self.server, mock }
+    }
+}
+
 /// A response to a [`RoomRelationsEndpoint`] query.
 #[derive(Default)]
 pub struct RoomRelationsResponseTemplate {
@@ -3943,6 +4183,16 @@ impl<'a> MockEndpoint<'a, DevicesEndpoint> {
     /// Returns a successful response.
     pub fn ok(self) -> MatrixMock<'a> {
         self.respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::DEVICES))
+    }
+}
+
+/// A prebuilt mock for `GET /devices/{deviceId}` requests.
+pub struct GetDeviceEndpoint;
+
+impl<'a> MockEndpoint<'a, GetDeviceEndpoint> {
+    /// Returns a successful response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::DEVICE))
     }
 }
 
@@ -4314,7 +4564,7 @@ impl<'a> MockEndpoint<'a, GetThreadSubscriptionsEndpoint> {
     }
 
     /// Add a single thread unsubscription to the response.
-    pub fn add_unsubcription(
+    pub fn add_unsubscription(
         mut self,
         room_id: OwnedRoomId,
         thread_root: OwnedEventId,
@@ -4463,5 +4713,58 @@ impl<'a> MockEndpoint<'a, SlidingSyncEndpoint> {
             on_builder(client.sliding_sync("test_id").unwrap()).build().await.unwrap();
 
         let _summary = sliding_sync.sync_once().await.unwrap();
+    }
+}
+
+/// A prebuilt mock for `GET /_matrix/client/*/profile/{user_id}/{key_name}`.
+pub struct GetProfileFieldEndpoint {
+    field: ProfileFieldName,
+}
+
+impl<'a> MockEndpoint<'a, GetProfileFieldEndpoint> {
+    /// Returns a successful response containing the given value, if any.
+    pub fn ok_with_value(self, value: Option<Value>) -> MatrixMock<'a> {
+        if let Some(value) = value {
+            let field = self.endpoint.field.to_string();
+            self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                field: value,
+            })))
+        } else {
+            self.ok_empty_json()
+        }
+    }
+}
+
+/// A prebuilt mock for `PUT /_matrix/client/*/profile/{user_id}/{key_name}`.
+pub struct SetProfileFieldEndpoint;
+
+impl<'a> MockEndpoint<'a, SetProfileFieldEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
+    }
+}
+
+/// A prebuilt mock for `DELETE /_matrix/client/*/profile/{user_id}/{key_name}`.
+pub struct DeleteProfileFieldEndpoint;
+
+impl<'a> MockEndpoint<'a, DeleteProfileFieldEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok(self) -> MatrixMock<'a> {
+        self.ok_empty_json()
+    }
+}
+
+/// A prebuilt mock for `GET /_matrix/client/*/profile/{user_id}`.
+pub struct GetProfileEndpoint;
+
+impl<'a> MockEndpoint<'a, GetProfileEndpoint> {
+    /// Returns a successful empty response.
+    pub fn ok_with_fields(self, fields: Vec<ProfileFieldValue>) -> MatrixMock<'a> {
+        let profile = fields
+            .iter()
+            .map(|field| (field.field_name(), field.value()))
+            .collect::<BTreeMap<_, _>>();
+        self.respond_with(ResponseTemplate::new(200).set_body_json(profile))
     }
 }

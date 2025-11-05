@@ -23,12 +23,12 @@ pub mod range;
 pub mod traits;
 
 use gloo_utils::format::JsValueSerdeExt;
+use indexed_db_futures::KeyRange;
 use range::IndexedKeyRange;
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 use traits::{Indexed, IndexedKey};
 use wasm_bindgen::JsValue;
-use web_sys::IdbKeyRange;
 
 use crate::serializer::SafeEncodeSerializer;
 
@@ -44,6 +44,19 @@ impl<T> From<serde_wasm_bindgen::Error> for IndexedTypeSerializerError<T> {
     fn from(e: serde_wasm_bindgen::Error) -> Self {
         Self::Serialization(serde::de::Error::custom(e.to_string()))
     }
+}
+
+/// A type encapsulating the output of serializing a value through
+/// [`IndexedTypeSerializer`]. This contains both the intermediary type - i.e.,
+/// [`Indexed::IndexedType`] - and the fully-serialized type - i.e.,
+/// [`JsValue`]. It is convenient for cases where one may want to examine the
+/// intermediary type.
+#[derive(Debug)]
+pub struct IndexedTypeSerializationOutput<T: Indexed> {
+    /// The intermediary value created in the process of serialization
+    pub indexed: T::IndexedType,
+    /// The fully-serialized value
+    pub value: JsValue,
 }
 
 /// A (de)serializer for an IndexedDB implementation of [`EventCacheStore`][1].
@@ -99,21 +112,15 @@ impl IndexedTypeSerializer {
     ///
     /// Note that the particular key which is encoded is defined by the type
     /// `K`.
-    pub fn encode_key_range<T, K>(
-        &self,
-        range: impl Into<IndexedKeyRange<K>>,
-    ) -> Result<IdbKeyRange, serde_wasm_bindgen::Error>
+    pub fn encode_key_range<T, K>(&self, range: impl Into<IndexedKeyRange<K>>) -> KeyRange<K>
     where
         T: Indexed,
         K: Serialize,
     {
-        use serde_wasm_bindgen::to_value;
-        Ok(match range.into() {
-            IndexedKeyRange::Only(key) => IdbKeyRange::only(&to_value(&key)?)?,
-            IndexedKeyRange::Bound(lower, upper) => {
-                IdbKeyRange::bound(&to_value(&lower)?, &to_value(&upper)?)?
-            }
-        })
+        match range.into() {
+            IndexedKeyRange::Only(key) => KeyRange::Only(key),
+            IndexedKeyRange::Bound(lower, upper) => KeyRange::Bound(lower, false, upper, false),
+        }
     }
 
     /// Encodes a key component range for an [`Indexed`] type.
@@ -123,7 +130,7 @@ impl IndexedTypeSerializer {
     pub fn encode_key_component_range<'a, T, K>(
         &self,
         range: impl Into<IndexedKeyRange<K::KeyComponents<'a>>>,
-    ) -> Result<IdbKeyRange, serde_wasm_bindgen::Error>
+    ) -> KeyRange<K>
     where
         T: Indexed,
         K: IndexedKey<T> + Serialize,
@@ -141,30 +148,37 @@ impl IndexedTypeSerializer {
         self.encode_key_range::<T, K>(range)
     }
 
-    /// Serializes an [`Indexed`] type into a [`JsValue`]
-    pub fn serialize<T>(&self, t: &T) -> Result<JsValue, IndexedTypeSerializerError<T::Error>>
+    /// Serializes an [`Indexed`] type into a [`JsValue`] and returns both the
+    /// [`JsValue`] and the intermediary [`Indexed::IndexedType`]
+    pub fn serialize<T>(
+        &self,
+        t: &T,
+    ) -> Result<IndexedTypeSerializationOutput<T>, IndexedTypeSerializerError<T::Error>>
     where
         T: Indexed,
         T::IndexedType: Serialize,
     {
         let indexed = t.to_indexed(&self.inner).map_err(IndexedTypeSerializerError::Indexing)?;
-        serde_wasm_bindgen::to_value(&indexed).map_err(Into::into)
+        let value = serde_wasm_bindgen::to_value(&indexed)?;
+        Ok(IndexedTypeSerializationOutput { indexed, value })
     }
 
     /// Serializes an [`Indexed`] type into a [`JsValue`] if the
-    /// [`Indexed::IndexedType`] meets criteria defined by `f`.
+    /// [`Indexed::IndexedType`] meets criteria defined by `f`. If successful,
+    /// returns both the [`JsValue`] and the [`Indexed::IndexedType`].
     pub fn serialize_if<T>(
         &self,
         t: &T,
         f: impl Fn(&T::IndexedType) -> bool,
-    ) -> Result<Option<JsValue>, IndexedTypeSerializerError<T::Error>>
+    ) -> Result<Option<IndexedTypeSerializationOutput<T>>, IndexedTypeSerializerError<T::Error>>
     where
         T: Indexed,
         T::IndexedType: Serialize,
     {
         let indexed = t.to_indexed(&self.inner).map_err(IndexedTypeSerializerError::Indexing)?;
         if f(&indexed) {
-            serde_wasm_bindgen::to_value(&indexed).map(Some).map_err(Into::into)
+            let value = serde_wasm_bindgen::to_value(&indexed)?;
+            Ok(Some(IndexedTypeSerializationOutput { indexed, value }))
         } else {
             Ok(None)
         }

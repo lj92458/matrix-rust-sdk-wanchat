@@ -10,9 +10,9 @@ use matrix_sdk::{
     HttpError, IdParseError, NotificationSettingsError as SdkNotificationSettingsError,
     QueueWedgeError as SdkQueueWedgeError, StoreError,
 };
-use matrix_sdk_ui::{encryption_sync_service, notification_client, sync_service, timeline};
+use matrix_sdk_ui::{encryption_sync_service, notification_client, spaces, sync_service, timeline};
 use ruma::{
-    api::client::error::{ErrorBody, ErrorKind as RumaApiErrorKind, RetryAfter},
+    api::client::error::{ErrorBody, ErrorKind as RumaApiErrorKind, RetryAfter, StandardErrorBody},
     MilliSecondsSinceUnixEpoch,
 };
 use tracing::warn;
@@ -64,7 +64,9 @@ impl From<matrix_sdk::Error> for ClientError {
         match e {
             matrix_sdk::Error::Http(http_error) => {
                 if let Some(api_error) = http_error.as_client_api_error() {
-                    if let ErrorBody::Standard { kind, message } = &api_error.body {
+                    if let ErrorBody::Standard(StandardErrorBody { kind, message, .. }) =
+                        &api_error.body
+                    {
                         let code = kind.errcode().to_string();
                         let Ok(kind) = kind.to_owned().try_into() else {
                             // We couldn't parse the API error, so we return a generic one instead
@@ -213,6 +215,12 @@ impl From<FocusEventError> for ClientError {
 
 impl From<RequestVerificationError> for ClientError {
     fn from(e: RequestVerificationError) -> Self {
+        Self::from_err(e)
+    }
+}
+
+impl From<spaces::Error> for ClientError {
+    fn from(e: spaces::Error) -> Self {
         Self::from_err(e)
     }
 }

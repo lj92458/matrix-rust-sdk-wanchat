@@ -15,8 +15,10 @@
 use std::sync::Arc;
 
 use as_variant::as_variant;
-use matrix_sdk::crypto::types::events::UtdCause;
-use matrix_sdk_base::latest_event::{PossibleLatestEvent, is_suitable_for_latest_event};
+use matrix_sdk_base::{
+    crypto::types::events::UtdCause,
+    latest_event::{PossibleLatestEvent, is_suitable_for_latest_event},
+};
 use ruma::{
     OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
     events::{
@@ -27,10 +29,7 @@ use ruma::{
             room::PolicyRuleRoomEventContent, server::PolicyRuleServerEventContent,
             user::PolicyRuleUserEventContent,
         },
-        poll::unstable_start::{
-            NewUnstablePollStartEventContent, SyncUnstablePollStartEvent,
-            UnstablePollStartEventContent,
-        },
+        poll::unstable_start::{SyncUnstablePollStartEvent, UnstablePollStartEventContent},
         room::{
             aliases::RoomAliasesEventContent,
             avatar::RoomAvatarEventContent,
@@ -294,9 +293,7 @@ impl TimelineItemContent {
                 }
             });
 
-        let mut poll = PollState::new(NewUnstablePollStartEventContent::new(
-            event.content.poll_start().clone(),
-        ));
+        let mut poll = PollState::new(event.content.poll_start().clone(), None);
         if let Some(edit) = edit {
             poll = poll.edit(edit).expect("the poll can't be ended yet!"); // TODO or can it?
         }

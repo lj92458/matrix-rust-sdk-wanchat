@@ -35,7 +35,9 @@ pub use identity_status_changes::IdentityStatusChanges;
 #[cfg(feature = "experimental-encrypted-state-events")]
 use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 #[cfg(feature = "e2e-encryption")]
-use matrix_sdk_base::crypto::{IdentityStatusChange, RoomIdentityProvider, UserIdentity};
+use matrix_sdk_base::crypto::{
+    IdentityStatusChange, RoomIdentityProvider, UserIdentity, types::events::CryptoContextInfo,
+};
 pub use matrix_sdk_base::store::StoredThreadSubscription;
 use matrix_sdk_base::{
     ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, SendOutsideWasm,
@@ -115,9 +117,9 @@ use ruma::{
             member::{MembershipChange, SyncRoomMemberEvent},
             message::{
                 AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
-                FormattedBody, ImageMessageEventContent, MessageType, RoomMessageEventContent,
-                UnstableAudioDetailsContentBlock, UnstableVoiceContentBlock, VideoInfo,
-                VideoMessageEventContent,
+                ImageMessageEventContent, MessageType, RoomMessageEventContent,
+                TextMessageEventContent, UnstableAmplitude, UnstableAudioDetailsContentBlock,
+                UnstableVoiceContentBlock, VideoInfo, VideoMessageEventContent,
             },
             name::RoomNameEventContent,
             pinned_events::RoomPinnedEventsEventContent,
@@ -154,6 +156,8 @@ pub use self::{
         Relations, RelationsOptions, ThreadRoots,
     },
 };
+#[cfg(feature = "e2e-encryption")]
+use crate::encryption::backups::BackupState;
 #[cfg(doc)]
 use crate::event_cache::EventCache;
 #[cfg(feature = "experimental-encrypted-state-events")]
@@ -177,8 +181,6 @@ use crate::{
     sync::RoomUpdate,
     utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
 };
-#[cfg(feature = "e2e-encryption")]
-use crate::{crypto::types::events::CryptoContextInfo, encryption::backups::BackupState};
 
 pub mod edit;
 pub mod futures;
@@ -292,13 +294,13 @@ impl PushContext {
 }
 
 macro_rules! make_media_type {
-    ($t:ty, $content_type: ident, $filename: ident, $source: ident, $caption: ident, $formatted_caption: ident, $info: ident, $thumbnail: ident) => {{
+    ($t:ty, $content_type: ident, $filename: ident, $source: ident, $caption: ident, $info: ident, $thumbnail: ident) => {{
         // If caption is set, use it as body, and filename as the file name; otherwise,
         // body is the filename, and the filename is not set.
         // https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
-        let (body, filename) = match $caption {
-            Some(caption) => (caption, Some($filename)),
-            None => ($filename, None),
+        let (body, formatted, filename) = match $caption {
+            Some(TextMessageEventContent { body, formatted, .. }) => (body, formatted, Some($filename)),
+            None => ($filename, None, None),
         };
 
         let (thumbnail_source, thumbnail_info) = $thumbnail.unzip();
@@ -312,7 +314,7 @@ macro_rules! make_media_type {
                 });
                 let content = assign!(ImageMessageEventContent::new(body, $source), {
                     info: Some(Box::new(info)),
-                    formatted: $formatted_caption,
+                    formatted,
                     filename
                 });
                 <$t>::Image(content)
@@ -320,18 +322,22 @@ macro_rules! make_media_type {
 
             mime::AUDIO => {
                 let mut content = assign!(AudioMessageEventContent::new(body, $source), {
-                    formatted: $formatted_caption,
+                    formatted,
                     filename
                 });
 
-                if let Some(AttachmentInfo::Voice { audio_info, waveform: Some(waveform_vec) }) =
-                    &$info
-                {
-                    if let Some(duration) = audio_info.duration {
-                        let waveform = waveform_vec.iter().map(|v| (*v).into()).collect();
-                        content.audio =
-                            Some(UnstableAudioDetailsContentBlock::new(duration, waveform));
-                    }
+                if let Some(AttachmentInfo::Audio(audio_info) | AttachmentInfo::Voice(audio_info)) = &$info &&
+                 let Some(duration) = audio_info.duration && let Some(waveform_vec) = &audio_info.waveform {
+                    let waveform = waveform_vec
+                        .iter()
+                        .map(|v| ((*v).clamp(0.0, 1.0) * UnstableAmplitude::MAX as f32) as u16)
+                        .map(Into::into)
+                        .collect();
+                    content.audio =
+                        Some(UnstableAudioDetailsContentBlock::new(duration, waveform));
+                }
+
+                if matches!($info, Some(AttachmentInfo::Voice(_))) {
                     content.voice = Some(UnstableVoiceContentBlock::new());
                 }
 
@@ -350,7 +356,7 @@ macro_rules! make_media_type {
                 });
                 let content = assign!(VideoMessageEventContent::new(body, $source), {
                     info: Some(Box::new(info)),
-                    formatted: $formatted_caption,
+                    formatted,
                     filename
                 });
                 <$t>::Video(content)
@@ -364,7 +370,7 @@ macro_rules! make_media_type {
                 });
                 let content = assign!(FileMessageEventContent::new(body, $source), {
                     info: Some(Box::new(info)),
-                    formatted: $formatted_caption,
+                    formatted,
                     filename,
                 });
                 <$t>::File(content)
@@ -2625,7 +2631,6 @@ impl Room {
                     filename,
                     media_source,
                     config.caption,
-                    config.formatted_caption,
                     config.info,
                     thumbnail,
                 ),
@@ -2648,21 +2653,11 @@ impl Room {
         content_type: &Mime,
         filename: String,
         source: MediaSource,
-        caption: Option<String>,
-        formatted_caption: Option<FormattedBody>,
+        caption: Option<TextMessageEventContent>,
         info: Option<AttachmentInfo>,
         thumbnail: Option<(MediaSource, Box<ThumbnailInfo>)>,
     ) -> MessageType {
-        make_media_type!(
-            MessageType,
-            content_type,
-            filename,
-            source,
-            caption,
-            formatted_caption,
-            info,
-            thumbnail
-        )
+        make_media_type!(MessageType, content_type, filename, source, caption, info, thumbnail)
     }
 
     /// Creates the [`RoomMessageEventContent`] based on the message type,
@@ -2693,21 +2688,11 @@ impl Room {
         content_type: &Mime,
         filename: String,
         source: MediaSource,
-        caption: Option<String>,
-        formatted_caption: Option<FormattedBody>,
+        caption: Option<TextMessageEventContent>,
         info: Option<AttachmentInfo>,
         thumbnail: Option<(MediaSource, Box<ThumbnailInfo>)>,
     ) -> GalleryItemType {
-        make_media_type!(
-            GalleryItemType,
-            content_type,
-            filename,
-            source,
-            caption,
-            formatted_caption,
-            info,
-            thumbnail
-        )
+        make_media_type!(GalleryItemType, content_type, filename, source, caption, info, thumbnail)
     }
 
     /// Update the power levels of a select set of users of this room.
@@ -4673,7 +4658,7 @@ pub struct RoomMemberWithSenderInfo {
 mod tests {
     use std::collections::BTreeMap;
 
-    use matrix_sdk_base::{ComposerDraft, store::ComposerDraftType};
+    use matrix_sdk_base::{ComposerDraft, DraftAttachment, store::ComposerDraftType};
     use matrix_sdk_test::{
         JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
         event_factory::EventFactory, test_json,
@@ -4869,6 +4854,14 @@ mod tests {
             plain_text: "Hello, world!".to_owned(),
             html_text: Some("<strong>Hello</strong>, world!".to_owned()),
             draft_type: ComposerDraftType::NewMessage,
+            attachments: vec![DraftAttachment {
+                filename: "cat.txt".to_owned(),
+                content: matrix_sdk_base::DraftAttachmentContent::File {
+                    data: b"meow".to_vec(),
+                    mimetype: Some("text/plain".to_owned()),
+                    size: Some(5),
+                },
+            }],
         };
 
         room.save_composer_draft(draft.clone(), None).await.unwrap();
@@ -4878,6 +4871,14 @@ mod tests {
             plain_text: "Hello, thread!".to_owned(),
             html_text: Some("<strong>Hello</strong>, thread!".to_owned()),
             draft_type: ComposerDraftType::NewMessage,
+            attachments: vec![DraftAttachment {
+                filename: "dog.txt".to_owned(),
+                content: matrix_sdk_base::DraftAttachmentContent::File {
+                    data: b"wuv".to_vec(),
+                    mimetype: Some("text/plain".to_owned()),
+                    size: Some(4),
+                },
+            }],
         };
 
         room.save_composer_draft(thread_draft.clone(), Some(&thread_root)).await.unwrap();
@@ -4913,7 +4914,7 @@ mod tests {
 
         let f = EventFactory::new().room(room_id);
         let joined_room_builder = JoinedRoomBuilder::new(room_id).add_state_bulk(vec![
-            f.member(user_id).membership(MembershipState::Knock).event_id(event_id).into_raw(),
+            f.member(user_id).membership(MembershipState::Knock).event_id(event_id).into(),
         ]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
@@ -4960,7 +4961,7 @@ mod tests {
 
         let f = EventFactory::new().room(room_id).sender(user_id!("@alice:b.c"));
         let joined_room_builder =
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into_raw()]);
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
@@ -4985,7 +4986,7 @@ mod tests {
 
         let f = EventFactory::new().room(room_id).sender(user_id);
         let joined_room_builder =
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into_raw()]);
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // When we load the membership details
@@ -5012,9 +5013,9 @@ mod tests {
 
         let f = EventFactory::new().room(room_id).sender(sender_id);
         let joined_room_builder = JoinedRoomBuilder::new(room_id).add_state_bulk(vec![
-            f.member(user_id).into_raw(),
+            f.member(user_id).into(),
             // The sender info comes from the sync
-            f.member(sender_id).into_raw(),
+            f.member(sender_id).into(),
         ]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
@@ -5042,7 +5043,7 @@ mod tests {
 
         let f = EventFactory::new().room(room_id).sender(sender_id);
         let joined_room_builder =
-            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into_raw()]);
+            JoinedRoomBuilder::new(room_id).add_state_bulk(vec![f.member(user_id).into()]);
         let room = server.sync_room(&client, joined_room_builder).await;
 
         // We'll receive the member info through the /members endpoint
@@ -5244,16 +5245,13 @@ mod tests {
         let mut user_map = BTreeMap::from([(sender_id.into(), 50.into())]);
 
         // Computing the power levels will need these 3 state events:
-        let room_create_event = f.create(sender_id, RoomVersionId::V1).state_key("").into_raw();
-        let power_levels_event = f.power_levels(&mut user_map).state_key("").into_raw();
-        let room_member_event = f.member(sender_id).into_raw();
+        let room_create_event = f.create(sender_id, RoomVersionId::V1).state_key("").into();
+        let power_levels_event = f.power_levels(&mut user_map).state_key("").into();
+        let room_member_event = f.member(sender_id).into();
 
         // With only the room member event
         let room = server
-            .sync_room(
-                &client,
-                JoinedRoomBuilder::new(room_id).add_state_bulk([room_member_event.clone()]),
-            )
+            .sync_room(&client, JoinedRoomBuilder::new(room_id).add_state_bulk([room_member_event]))
             .await;
         let ctx = room
             .push_condition_room_ctx()
@@ -5266,10 +5264,7 @@ mod tests {
 
         // Adding the room creation event
         let room = server
-            .sync_room(
-                &client,
-                JoinedRoomBuilder::new(room_id).add_state_bulk([room_create_event.clone()]),
-            )
+            .sync_room(&client, JoinedRoomBuilder::new(room_id).add_state_bulk([room_create_event]))
             .await;
         let ctx = room
             .push_condition_room_ctx()

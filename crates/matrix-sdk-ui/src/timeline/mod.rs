@@ -50,8 +50,8 @@ use ruma::{
         relation::Thread,
         room::{
             message::{
-                FormattedBody, Relation, RelationWithoutReplacement, ReplyWithinThread,
-                RoomMessageEventContentWithoutRelation,
+                Relation, RelationWithoutReplacement, ReplyWithinThread,
+                RoomMessageEventContentWithoutRelation, TextMessageEventContent,
             },
             pinned_events::RoomPinnedEventsEventContent,
         },
@@ -185,8 +185,7 @@ pub struct AttachmentConfig {
     pub txn_id: Option<OwnedTransactionId>,
     pub info: Option<AttachmentInfo>,
     pub thumbnail: Option<Thumbnail>,
-    pub caption: Option<String>,
-    pub formatted_caption: Option<FormattedBody>,
+    pub caption: Option<TextMessageEventContent>,
     pub mentions: Option<Mentions>,
     pub in_reply_to: Option<OwnedEventId>,
 }
@@ -257,7 +256,13 @@ impl Timeline {
     /// Get the latest of the timeline's event items.
     pub async fn latest_event(&self) -> Option<EventTimelineItem> {
         if self.controller.is_live() {
-            self.controller.items().await.last()?.as_event().cloned()
+            self.controller.items().await.iter().rev().find_map(|item| {
+                if let TimelineItemKind::Event(event) = item.kind() {
+                    Some(event.to_owned())
+                } else {
+                    None
+                }
+            })
         } else {
             None
         }
@@ -985,8 +990,7 @@ where
 pub struct GalleryConfig {
     pub(crate) txn_id: Option<OwnedTransactionId>,
     pub(crate) items: Vec<GalleryItemInfo>,
-    pub(crate) caption: Option<String>,
-    pub(crate) formatted_caption: Option<FormattedBody>,
+    pub(crate) caption: Option<TextMessageEventContent>,
     pub(crate) mentions: Option<Mentions>,
     pub(crate) in_reply_to: Option<OwnedEventId>,
 }
@@ -1027,18 +1031,8 @@ impl GalleryConfig {
     /// # Arguments
     ///
     /// * `caption` - The optional caption.
-    pub fn caption(mut self, caption: Option<String>) -> Self {
+    pub fn caption(mut self, caption: Option<TextMessageEventContent>) -> Self {
         self.caption = caption;
-        self
-    }
-
-    /// Set the optional formatted caption.
-    ///
-    /// # Arguments
-    ///
-    /// * `formatted_caption` - The optional formatted caption.
-    pub fn formatted_caption(mut self, formatted_caption: Option<FormattedBody>) -> Self {
-        self.formatted_caption = formatted_caption;
         self
     }
 
@@ -1084,9 +1078,7 @@ pub struct GalleryItemInfo {
     /// The attachment info.
     pub attachment_info: AttachmentInfo,
     /// The caption.
-    pub caption: Option<String>,
-    /// The formatted caption.
-    pub formatted_caption: Option<FormattedBody>,
+    pub caption: Option<TextMessageEventContent>,
     /// The thumbnail.
     pub thumbnail: Option<Thumbnail>,
 }
@@ -1103,7 +1095,6 @@ impl TryFrom<GalleryItemInfo> for matrix_sdk::attachment::GalleryItemInfo {
             data,
             attachment_info: value.attachment_info,
             caption: value.caption,
-            formatted_caption: value.formatted_caption,
             thumbnail: value.thumbnail,
         })
     }

@@ -27,31 +27,55 @@
 //! - `SpaceRoomList`: A component for retrieving a space's children rooms and
 //!   their details.
 
-use std::sync::Arc;
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use eyeball_im::{ObservableVector, VectorSubscriberBatchedStream};
 use futures_util::pin_mut;
 use imbl::Vector;
+use itertools::Itertools;
 use matrix_sdk::{
-    Client, deserialized_responses::SyncOrStrippedState, executor::AbortOnDrop, locks::Mutex,
+    Client, Error as SDKError, deserialized_responses::SyncOrStrippedState, executor::AbortOnDrop,
 };
 use matrix_sdk_common::executor::spawn;
 use ruma::{
-    OwnedRoomId,
+    OwnedRoomId, RoomId,
     events::{
-        SyncStateEvent,
+        self, SyncStateEvent,
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
     },
 };
+use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::error;
 
-use crate::spaces::graph::SpaceGraph;
+use crate::spaces::{graph::SpaceGraph, leave::LeaveSpaceHandle};
 pub use crate::spaces::{room::SpaceRoom, room_list::SpaceRoomList};
 
 pub mod graph;
+pub mod leave;
 pub mod room;
 pub mod room_list;
+
+/// Possible [`SpaceService`] errors.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// The requested room was not found.
+    #[error("Room `{0}` not found")]
+    RoomNotFound(OwnedRoomId),
+
+    /// Failed to leave a space.
+    #[error("Failed to leave space")]
+    LeaveSpace(SDKError),
+
+    /// Failed to load members.
+    #[error("Failed to load members")]
+    LoadRoomMembers(SDKError),
+}
+
+struct SpaceState {
+    graph: SpaceGraph,
+    joined_rooms: ObservableVector<SpaceRoom>,
+}
 
 /// The main entry point into the Spaces facilities.
 ///
@@ -95,7 +119,7 @@ pub mod room_list;
 pub struct SpaceService {
     client: Client,
 
-    joined_spaces: Arc<Mutex<ObservableVector<SpaceRoom>>>,
+    space_state: Arc<AsyncMutex<SpaceState>>,
 
     room_update_handle: AsyncMutex<Option<AbortOnDrop<()>>>,
 }
@@ -105,7 +129,10 @@ impl SpaceService {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            joined_spaces: Arc::new(Mutex::new(ObservableVector::new())),
+            space_state: Arc::new(AsyncMutex::new(SpaceState {
+                graph: SpaceGraph::new(),
+                joined_rooms: ObservableVector::new(),
+            })),
             room_update_handle: AsyncMutex::new(None),
         }
     }
@@ -119,7 +146,7 @@ impl SpaceService {
 
         if room_update_handle.is_none() {
             let client = self.client.clone();
-            let joined_spaces = Arc::clone(&self.joined_spaces);
+            let space_state = Arc::clone(&self.space_state);
             let all_room_updates_receiver = self.client.subscribe_to_all_room_updates();
 
             *room_update_handle = Some(AbortOnDrop::new(spawn(async move {
@@ -132,8 +159,13 @@ impl SpaceService {
                                 continue;
                             }
 
-                            let new_spaces = Vector::from(Self::joined_spaces_for(&client).await);
-                            Self::update_joined_spaces_if_needed(new_spaces, &joined_spaces);
+                            let (spaces, graph) = Self::joined_spaces_for(&client).await;
+                            Self::update_joined_spaces_if_needed(
+                                Vector::from(spaces),
+                                graph,
+                                &space_state,
+                            )
+                            .await;
                         }
                         Err(err) => {
                             error!("error when listening to room updates: {err}");
@@ -143,20 +175,26 @@ impl SpaceService {
             })));
 
             // Make sure to also update the currently joined spaces for the initial values.
-            let spaces = Self::joined_spaces_for(&self.client).await;
-            Self::update_joined_spaces_if_needed(Vector::from(spaces), &self.joined_spaces);
+            let (spaces, graph) = Self::joined_spaces_for(&self.client).await;
+            Self::update_joined_spaces_if_needed(Vector::from(spaces), graph, &self.space_state)
+                .await;
         }
 
-        self.joined_spaces.lock().subscribe().into_values_and_batched_stream()
+        self.space_state.lock().await.joined_rooms.subscribe().into_values_and_batched_stream()
     }
 
     /// Returns a list of all the top-level joined spaces. It will eagerly
     /// compute the latest version and also notify subscribers if there were
     /// any changes.
     pub async fn joined_spaces(&self) -> Vec<SpaceRoom> {
-        let spaces = Self::joined_spaces_for(&self.client).await;
+        let (spaces, graph) = Self::joined_spaces_for(&self.client).await;
 
-        Self::update_joined_spaces_if_needed(Vector::from(spaces.clone()), &self.joined_spaces);
+        Self::update_joined_spaces_if_needed(
+            Vector::from(spaces.clone()),
+            graph,
+            &self.space_state,
+        )
+        .await;
 
         spaces
     }
@@ -166,19 +204,43 @@ impl SpaceService {
         SpaceRoomList::new(self.client.clone(), space_id).await
     }
 
-    fn update_joined_spaces_if_needed(
-        new_spaces: Vector<SpaceRoom>,
-        joined_spaces: &Arc<Mutex<ObservableVector<SpaceRoom>>>,
-    ) {
-        let old_spaces = joined_spaces.lock().clone();
+    /// Start a space leave process returning a [`LeaveSpaceHandle`] from which
+    /// rooms can be retrieved in reversed BFS order starting from the requested
+    /// `space_id` graph node. If the room is unknown then an error will be
+    /// returned.
+    ///
+    /// Once the rooms to be left are chosen the handle can be used to leave
+    /// them.
+    pub async fn leave_space(&self, space_id: &RoomId) -> Result<LeaveSpaceHandle, Error> {
+        let space_state = self.space_state.lock().await;
 
-        if new_spaces != old_spaces {
-            joined_spaces.lock().clear();
-            joined_spaces.lock().append(new_spaces);
+        if !space_state.graph.has_node(space_id) {
+            return Err(Error::RoomNotFound(space_id.to_owned()));
         }
+
+        let room_ids = space_state.graph.flattened_bottom_up_subtree(space_id);
+
+        let handle = LeaveSpaceHandle::new(self.client.clone(), room_ids).await;
+
+        Ok(handle)
     }
 
-    async fn joined_spaces_for(client: &Client) -> Vec<SpaceRoom> {
+    async fn update_joined_spaces_if_needed(
+        new_spaces: Vector<SpaceRoom>,
+        new_graph: SpaceGraph,
+        space_state: &Arc<AsyncMutex<SpaceState>>,
+    ) {
+        let mut space_state = space_state.lock().await;
+
+        if new_spaces != space_state.joined_rooms.clone() {
+            space_state.joined_rooms.clear();
+            space_state.joined_rooms.append(new_spaces);
+        }
+
+        space_state.graph = new_graph;
+    }
+
+    async fn joined_spaces_for(client: &Client) -> (Vec<SpaceRoom>, SpaceGraph) {
         let joined_spaces = client.joined_space_rooms();
 
         // Build a graph to hold the parent-child relations
@@ -230,18 +292,46 @@ impl SpaceService {
 
         let root_nodes = graph.root_nodes();
 
-        joined_spaces
+        // Proceed with filtering to the top level spaces, sorting them by their
+        // (optional) order field (as defined in MSC3230) and then mapping them
+        // to `SpaceRoom`s.
+        let top_level_spaces = joined_spaces
             .iter()
-            .filter_map(|room| {
-                let room_id = room.room_id();
+            .filter(|room| root_nodes.contains(&room.room_id()))
+            .collect::<Vec<_>>();
 
-                if root_nodes.contains(&room_id) {
-                    Some(SpaceRoom::new_from_known(room, graph.children_of(room_id).len() as u64))
-                } else {
-                    None
+        let mut top_level_space_order = HashMap::new();
+        for space in &top_level_spaces {
+            if let Ok(Some(raw_event)) =
+                space.account_data_static::<events::space_order::SpaceOrderEventContent>().await
+                && let Ok(event) = raw_event.deserialize()
+            {
+                top_level_space_order.insert(space.room_id().to_owned(), event.content.order);
+            }
+        }
+
+        let top_level_spaces = top_level_spaces
+            .iter()
+            .sorted_by(|a, b| {
+                // MSC3230: lexicographically by `order` and then by room ID
+                match (
+                    top_level_space_order.get(a.room_id()),
+                    top_level_space_order.get(b.room_id()),
+                ) {
+                    (Some(a_order), Some(b_order)) => {
+                        a_order.cmp(b_order).then(a.room_id().cmp(b.room_id()))
+                    }
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => a.room_id().cmp(b.room_id()),
                 }
             })
-            .collect()
+            .map(|room| {
+                SpaceRoom::new_from_known(room, graph.children_of(room.room_id()).len() as u64)
+            })
+            .collect();
+
+        (top_level_spaces, graph)
     }
 }
 
@@ -252,9 +342,11 @@ mod tests {
     use futures_util::{StreamExt, pin_mut};
     use matrix_sdk::{room::ParentSpace, test_utils::mocks::MatrixMockServer};
     use matrix_sdk_test::{
-        JoinedRoomBuilder, LeftRoomBuilder, async_test, event_factory::EventFactory,
+        JoinedRoomBuilder, LeftRoomBuilder, RoomAccountDataTestEvent, async_test,
+        event_factory::EventFactory,
     };
-    use ruma::{RoomVersionId, owned_room_id, room_id};
+    use ruma::{RoomVersionId, UserId, owned_room_id, room_id};
+    use serde_json::json;
     use stream_assert::{assert_next_eq, assert_pending};
 
     use super::*;
@@ -490,5 +582,65 @@ mod tests {
             space_service.joined_spaces().await,
             vec![SpaceRoom::new_from_known(&client.get_room(first_space_id).unwrap(), 0)]
         );
+    }
+
+    #[async_test]
+    async fn test_top_level_space_order() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+
+        server.mock_room_state_encryption().plain().mount().await;
+
+        add_space_rooms_with(
+            vec![
+                (room_id!("!2:a.b"), Some("2")),
+                (room_id!("!4:a.b"), None),
+                (room_id!("!3:a.b"), None),
+                (room_id!("!1:a.b"), Some("1")),
+            ],
+            &client,
+            &server,
+            &EventFactory::new(),
+            client.user_id().unwrap(),
+        )
+        .await;
+
+        let space_service = SpaceService::new(client.clone());
+
+        // Space with an `order` field set should come first in lexicographic
+        // order and rest sorted by room ID.
+        assert_eq!(
+            space_service.joined_spaces().await,
+            vec![
+                SpaceRoom::new_from_known(&client.get_room(room_id!("!1:a.b")).unwrap(), 0),
+                SpaceRoom::new_from_known(&client.get_room(room_id!("!2:a.b")).unwrap(), 0),
+                SpaceRoom::new_from_known(&client.get_room(room_id!("!3:a.b")).unwrap(), 0),
+                SpaceRoom::new_from_known(&client.get_room(room_id!("!4:a.b")).unwrap(), 0),
+            ]
+        );
+    }
+
+    async fn add_space_rooms_with(
+        rooms: Vec<(&RoomId, Option<&str>)>,
+        client: &Client,
+        server: &MatrixMockServer,
+        factory: &EventFactory,
+        user_id: &UserId,
+    ) {
+        for (room_id, order) in rooms {
+            let mut builder = JoinedRoomBuilder::new(room_id)
+                .add_state_event(factory.create(user_id, RoomVersionId::V1).with_space_type());
+
+            if let Some(order) = order {
+                builder = builder.add_account_data(RoomAccountDataTestEvent::Custom(json!({
+                    "type": "m.space_order",
+                      "content": {
+                        "order": order
+                      }
+                })));
+            }
+
+            server.sync_room(client, builder).await;
+        }
     }
 }

@@ -21,7 +21,7 @@ use deadpool_sqlite::{Object as SqliteAsyncConn, Pool as SqlitePool, Runtime};
 use matrix_sdk_base::{
     deserialized_responses::TimelineEvent,
     event_cache::{
-        store::{compute_filters_string, extract_event_relation, EventCacheStore},
+        store::{extract_event_relation, EventCacheStore},
         Event, Gap,
     },
     linked_chunk::{
@@ -34,7 +34,9 @@ use matrix_sdk_store_encryption::StoreCipher;
 use ruma::{
     events::relation::RelationType, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId,
 };
-use rusqlite::{params_from_iter, OptionalExtension, ToSql, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, params_from_iter, OptionalExtension, ToSql, Transaction, TransactionBehavior,
+};
 use tokio::{
     fs,
     sync::{Mutex, OwnedMutexGuard},
@@ -53,6 +55,7 @@ use crate::{
 mod keys {
     // Tables
     pub const LINKED_CHUNKS: &str = "linked_chunks";
+    pub const EVENTS: &str = "events";
 }
 
 /// The database name.
@@ -63,7 +66,7 @@ const DATABASE_NAME: &str = "matrix-sdk-event-cache.sqlite3";
 /// This is used to figure whether the SQLite database requires a migration.
 /// Every new SQL migration should imply a bump of this number, and changes in
 /// the [`run_migrations`] function.
-const DATABASE_VERSION: u8 = 11;
+const DATABASE_VERSION: u8 = 12;
 
 /// The string used to identify a chunk of type events, in the `type` field in
 /// the database.
@@ -165,7 +168,7 @@ impl SqliteEventCacheStore {
         })
     }
 
-    // Acquire a connection for executing read operations.
+    /// Acquire a connection for executing read operations.
     #[instrument(skip_all)]
     async fn read(&self) -> Result<SqliteAsyncConn> {
         trace!("Taking a `read` connection");
@@ -182,7 +185,7 @@ impl SqliteEventCacheStore {
         Ok(connection)
     }
 
-    // Acquire a connection for executing write operations.
+    /// Acquire a connection for executing write operations.
     #[instrument(skip_all)]
     async fn write(&self) -> Result<OwnedMutexGuard<SqliteAsyncConn>> {
         trace!("Taking a `write` connection");
@@ -472,6 +475,16 @@ async fn run_migrations(conn: &SqliteAsyncConn, version: u8) -> Result<()> {
         .await?;
     }
 
+    if version < 12 {
+        conn.with_transaction(|txn| {
+            txn.execute_batch(include_str!(
+                "../migrations/event_cache_store/012_store_event_type.sql"
+            ))?;
+            txn.set_db_version(12)
+        })
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -632,7 +645,7 @@ impl EventCacheStore for SqliteEventCacheStore {
                         // deduplicated and moved to another position; or because it was inserted
                         // outside the context of a linked chunk (e.g. pinned event).
                         let mut content_statement = txn.prepare(
-                            "INSERT OR REPLACE INTO events(room_id, event_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?)"
+                            "INSERT OR REPLACE INTO events(room_id, event_id, event_type, session_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?, ?, ?)"
                         )?;
 
                         let invalid_event = |event: TimelineEvent| {
@@ -641,20 +654,28 @@ impl EventCacheStore for SqliteEventCacheStore {
                                 return None;
                             };
 
-                            Some((event_id.to_string(), event))
+                            let Some(event_type) = event.kind.event_type() else {
+                                error!(%event_id, "Trying to save an event with no event type");
+                                return None;
+                            };
+
+                            Some((event_id.to_string(), event_type, event))
                         };
 
                         let room_id = linked_chunk_id.room_id();
                         let hashed_room_id = this.encode_key(keys::LINKED_CHUNKS, room_id);
 
-                        for (i, (event_id, event)) in items.into_iter().filter_map(invalid_event).enumerate() {
+                        for (i, (event_id, event_type, event)) in items.into_iter().filter_map(invalid_event).enumerate() {
                             // Insert the location information into the database.
                             let index = at.index() + i;
                             chunk_statement.execute((chunk_id, &hashed_linked_chunk_id, &event_id, index))?;
 
+                            let session_id = event.kind.session_id().map(|s| this.encode_key(keys::EVENTS, s));
+                            let event_type = this.encode_key(keys::EVENTS, event_type);
+
                             // Now, insert the event content into the database.
                             let encoded_event = this.encode_event(&event)?;
-                            content_statement.execute((&hashed_room_id, event_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
+                            content_statement.execute((&hashed_room_id, event_id, event_type, session_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
                         }
                     }
 
@@ -671,6 +692,14 @@ impl EventCacheStore for SqliteEventCacheStore {
                             continue;
                         };
 
+                        let Some(event_type) = event.kind.event_type() else {
+                            error!(%event_id, "Trying to save an event with no event type");
+                            continue;
+                        };
+
+                        let session_id = event.kind.session_id().map(|s| this.encode_key(keys::EVENTS, s));
+                        let event_type = this.encode_key(keys::EVENTS, event_type);
+
                         // Replace the event's content. Really we'd like to update, but in case the
                         // event id changed, we are a bit lenient here and will allow an insertion
                         // of the new event.
@@ -678,8 +707,8 @@ impl EventCacheStore for SqliteEventCacheStore {
                         let room_id = linked_chunk_id.room_id();
                         let hashed_room_id = this.encode_key(keys::LINKED_CHUNKS, room_id);
                         txn.execute(
-                            "INSERT OR REPLACE INTO events(room_id, event_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?)"
-                        , (&hashed_room_id, &event_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
+                            "INSERT OR REPLACE INTO events(room_id, event_id, event_type, session_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (&hashed_room_id, &event_id, event_type, session_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
 
                         // Replace the event id in the linked chunk, in case it changed.
                         txn.execute(
@@ -1302,19 +1331,47 @@ impl EventCacheStore for SqliteEventCacheStore {
     }
 
     #[instrument(skip(self))]
-    async fn get_room_events(&self, room_id: &RoomId) -> Result<Vec<Event>, Self::Error> {
+    async fn get_room_events(
+        &self,
+        room_id: &RoomId,
+        event_type: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Event>, Self::Error> {
         let _timer = timer!("method");
 
         let this = self.clone();
 
         let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
+        let hashed_event_type = event_type.map(|e| self.encode_key(keys::EVENTS, e));
+        let hashed_session_id = session_id.map(|s| self.encode_key(keys::EVENTS, s));
 
         self.read()
             .await?
             .with_transaction(move |txn| -> Result<_> {
-                let mut statement = txn.prepare("SELECT content FROM events WHERE room_id = ?")?;
-                let maybe_events =
-                    statement.query_map((hashed_room_id,), |row| row.get::<_, Vec<u8>>(0))?;
+                // I'm not sure why clippy claims that the clones aren't required. The compiler
+                // tells us that the lifetimes aren't long enough if we remove them. Doesn't matter
+                // much so let's silence things.
+                #[allow(clippy::redundant_clone)]
+                let (query, keys) = match (hashed_event_type, hashed_session_id) {
+                    (None, None) => {
+                        ("SELECT content FROM events WHERE room_id = ?", params![hashed_room_id])
+                    }
+                    (None, Some(session_id)) => (
+                        "SELECT content FROM events WHERE room_id = ?1 AND session_id = ?2",
+                        params![hashed_room_id, session_id.to_owned()],
+                    ),
+                    (Some(event_type), None) => (
+                        "SELECT content FROM events WHERE room_id = ? AND event_type = ?",
+                        params![hashed_room_id, event_type.to_owned()]
+                    ),
+                    (Some(event_type), Some(session_id)) => (
+                        "SELECT content FROM events WHERE room_id = ?1 AND event_type = ?2 AND session_id = ?3",
+                        params![hashed_room_id, event_type.to_owned(), session_id.to_owned()],
+                    ),
+                };
+
+                let mut statement = txn.prepare(query)?;
+                let maybe_events = statement.query_map(keys, |row| row.get::<_, Vec<u8>>(0))?;
 
                 let mut events = Vec::new();
                 for ev in maybe_events {
@@ -1332,9 +1389,17 @@ impl EventCacheStore for SqliteEventCacheStore {
         let _timer = timer!("method");
 
         let Some(event_id) = event.event_id() else {
-            error!(%room_id, "Trying to save an event with no ID");
+            error!("Trying to save an event with no ID");
             return Ok(());
         };
+
+        let Some(event_type) = event.kind.event_type() else {
+            error!(%event_id, "Trying to save an event with no event type");
+            return Ok(());
+        };
+
+        let event_type = self.encode_key(keys::EVENTS, event_type);
+        let session_id = event.kind.session_id().map(|s| self.encode_key(keys::EVENTS, s));
 
         let hashed_room_id = self.encode_key(keys::LINKED_CHUNKS, room_id);
         let event_id = event_id.to_string();
@@ -1344,8 +1409,8 @@ impl EventCacheStore for SqliteEventCacheStore {
             .await?
             .with_transaction(move |txn| -> Result<_> {
                 txn.execute(
-                    "INSERT OR REPLACE INTO events(room_id, event_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?)"
-                    , (&hashed_room_id, &event_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
+                    "INSERT OR REPLACE INTO events(room_id, event_id, event_type, session_id, content, relates_to, rel_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (&hashed_room_id, &event_id, event_type, session_id, encoded_event.content, encoded_event.relates_to, encoded_event.rel_type))?;
 
                 Ok(())
             })
@@ -1390,7 +1455,7 @@ fn find_event_relations_transaction(
         Ok(related)
     };
 
-    let related = if let Some(filters) = compute_filters_string(filters.as_deref()) {
+    let related = if let Some(filters) = filters {
         let question_marks = repeat_vars(filters.len());
         let query = format!(
             "SELECT events.content, event_chunks.chunk_id, event_chunks.position
@@ -1399,7 +1464,16 @@ fn find_event_relations_transaction(
             WHERE relates_to = ? AND room_id = ? AND rel_type IN ({question_marks})"
         );
 
-        let filters: Vec<_> = filters.iter().map(|f| f.to_sql().unwrap()).collect();
+        // First the filters need to be stringified; because `.to_sql()` will borrow
+        // from them, they also need to be stringified onto the stack, so as to
+        // get a stable address (to avoid returning a temporary reference in the
+        // map closure below).
+        let filter_strings: Vec<_> = filters.iter().map(|f| f.to_string()).collect();
+        let filters_params: Vec<_> = filter_strings
+            .iter()
+            .map(|f| f.to_sql().expect("converting a string to SQL should work"))
+            .collect();
+
         let parameters = params_from_iter(
             [
                 hashed_linked_chunk_id.to_sql().expect(
@@ -1414,7 +1488,7 @@ fn find_event_relations_transaction(
                     .expect("We should be able to convert a room ID to a SQLite value"),
             ]
             .into_iter()
-            .chain(filters),
+            .chain(filters_params),
         );
 
         let mut transaction = txn.prepare(&query)?;

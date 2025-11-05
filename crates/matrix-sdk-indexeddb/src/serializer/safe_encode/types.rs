@@ -20,11 +20,11 @@ use base64::{
     Engine,
 };
 use gloo_utils::format::JsValueSerdeExt;
+use indexed_db_futures::KeyRange;
 use matrix_sdk_crypto::CryptoStoreError;
 use matrix_sdk_store_encryption::{EncryptedValueBase64, StoreCipher};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use wasm_bindgen::JsValue;
-use web_sys::IdbKeyRange;
 use zeroize::Zeroizing;
 
 use crate::serializer::safe_encode::traits::SafeEncode;
@@ -89,6 +89,14 @@ impl SafeEncodeSerializer {
         Self { store_cipher }
     }
 
+    /// Returns whether this serializer contains a nested [`StoreCipher`]. If
+    /// so, values passed to the serializer will be encrypted when serialized
+    /// and decrypted when deserialized.
+    #[cfg(feature = "media-store")]
+    pub fn has_store_cipher(&self) -> bool {
+        self.store_cipher.is_some()
+    }
+
     /// Hash the given key securely for the given tablename using the store
     /// cipher.
     ///
@@ -146,11 +154,7 @@ impl SafeEncodeSerializer {
         }
     }
 
-    pub fn encode_to_range<T>(
-        &self,
-        table_name: &str,
-        key: T,
-    ) -> Result<IdbKeyRange, SafeEncodeSerializerError>
+    pub fn encode_to_range<T>(&self, table_name: &str, key: T) -> KeyRange<JsValue>
     where
         T: SafeEncode,
     {
@@ -158,11 +162,6 @@ impl SafeEncodeSerializer {
             Some(cipher) => key.encode_to_range_secure(table_name, cipher),
             None => key.encode_to_range(),
         }
-        .map_err(|e| SafeEncodeSerializerError::DomException {
-            code: 0,
-            name: "IdbKeyRangeMakeError".to_owned(),
-            message: e,
-        })
     }
 
     /// Encode the value for storage as a value in indexeddb.

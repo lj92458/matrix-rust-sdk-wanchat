@@ -11,6 +11,16 @@ All notable changes to this project will be documented in this file.
 - `Client::sync_lock` has been renamed `Client::state_store_lock`.
   ([#5707](https://github.com/matrix-org/matrix-rust-sdk/pull/5707))
 
+### Features
+
+- [**breaking**] The `EventCacheStore::get_room_events()` method has received
+  two new arguments. This allows users to load only events of a certain event
+  type and events that were encrypted using a certain room key identified by its
+  session ID.
+  ([#5817](https://github.com/matrix-org/matrix-rust-sdk/pull/5817))
+- `ComposerDraft` can now store attachments alongside text messages.
+  ([#5794](https://github.com/matrix-org/matrix-rust-sdk/pull/5794))
+
 ## [0.14.1] - 2025-09-10
 
 ### Security Fixes

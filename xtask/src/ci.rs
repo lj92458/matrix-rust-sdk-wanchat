@@ -234,7 +234,7 @@ fn check_clippy() -> Result<()> {
         "rustup run {NIGHTLY} cargo clippy --workspace --all-targets
             --exclude matrix-sdk-crypto --exclude xtask
             --no-default-features
-            --features native-tls,sso-login,testing,experimental-element-recent-emojis
+            --features native-tls,sso-login,sqlite,testing,experimental-element-recent-emojis
             -- -D warnings"
     )
     .run()?;
@@ -440,6 +440,10 @@ fn run_wasm_pack_tests(cmd: Option<WasmFeatureSet>) -> Result<()> {
             .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
             .run()?;
         cmd!(sh, "wasm-pack test --firefox --headless --")
+            .args(arg_set.split_whitespace())
+            .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
+            .run()?;
+        cmd!(sh, "wasm-pack test --chrome --headless --")
             .args(arg_set.split_whitespace())
             .env(WASM_TIMEOUT_ENV_KEY, WASM_TIMEOUT_VALUE)
             .run()

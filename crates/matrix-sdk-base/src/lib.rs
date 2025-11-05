@@ -14,7 +14,7 @@
 // limitations under the License.
 
 #![doc = include_str!("../README.md")]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
 #![warn(missing_docs, missing_debug_implementations)]
 
@@ -64,8 +64,9 @@ pub use room::{
     RoomState, RoomStateFilter, SuccessorRoom, apply_redaction,
 };
 pub use store::{
-    ComposerDraft, ComposerDraftType, QueueWedgeError, StateChanges, StateStore, StateStoreDataKey,
-    StateStoreDataValue, StoreError, ThreadSubscriptionCatchupToken,
+    ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent, DraftThumbnail,
+    QueueWedgeError, StateChanges, StateStore, StateStoreDataKey, StateStoreDataValue, StoreError,
+    ThreadSubscriptionCatchupToken,
 };
 pub use utils::{
     MinimalRoomMemberEvent, MinimalStateEvent, OriginalMinimalStateEvent, RedactedMinimalStateEvent,
