@@ -93,7 +93,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, error};
 use url::Url;
-
+use matrix_sdk::custom_state_subscriber::GlobalCustomStateSubscriber;
 use super::{
     room::{room_info::RoomInfo, Room},
     session_verification::SessionVerificationController,
@@ -357,7 +357,7 @@ impl Client {
                 },
             )?;
         }
-
+        GlobalCustomStateSubscriber::init_and_register(Arc::new(sdk_client.clone()));
         Ok(client)
     }
 }

@@ -34,7 +34,7 @@ use ruma::{
     serde::Raw,
     time::Instant,
 };
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use super::{
     DependentQueuedRequest, DependentQueuedRequestKind, QueuedRequestKind, Result, RoomInfo,
@@ -1038,6 +1038,44 @@ impl StateStore for MemoryStore {
 
         Ok(())
     }
+
+    async fn get_state_event_all(
+        &self,
+        room_id: &RoomId,
+    ) -> std::result::Result<Vec<RawAnySyncOrStrippedState>, Self::Error> {
+        debug!("get_state_event_all memory_store");
+        fn collect_events<T>(
+            state_map: &HashMap<OwnedRoomId, HashMap<StateEventType, HashMap<String, Raw<T>>>>,
+            room_id: &RoomId,
+            to_enum: fn(Raw<T>) -> RawAnySyncOrStrippedState,
+        ) -> Vec<RawAnySyncOrStrippedState> {
+            let mut result = Vec::new();
+            if let Some(room_events) = state_map.get(room_id) {
+                for (_event_type, events_by_key) in room_events {
+                    result.extend(
+                        events_by_key
+                            .values()
+                            .cloned()
+                            .map(to_enum),
+                    );
+                }
+            }
+            result
+        }
+        let inner = self.inner.read().unwrap();
+        let mut events = collect_events(
+            &inner.stripped_room_state,
+            room_id,
+            RawAnySyncOrStrippedState::Stripped,
+        );
+        events.extend(collect_events(
+            &inner.room_state,
+            room_id,
+            RawAnySyncOrStrippedState::Sync,
+        ));
+        Ok(events)
+    }
+
 }
 
 #[cfg(test)]

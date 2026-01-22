@@ -27,7 +27,7 @@ use async_stream::stream;
 use eyeball::SharedObservable;
 use futures_core::Stream;
 use futures_util::{
-    StreamExt, future::join_all, stream as futures_stream, stream::FuturesUnordered,
+    future::join_all, stream as futures_stream, stream::FuturesUnordered, StreamExt,
 };
 use http::StatusCode;
 #[cfg(feature = "e2e-encryption")]
@@ -36,25 +36,25 @@ pub use identity_status_changes::IdentityStatusChanges;
 use matrix_sdk_base::crypto::types::events::room::encrypted::EncryptedEvent;
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::crypto::{
-    IdentityStatusChange, RoomIdentityProvider, UserIdentity, types::events::CryptoContextInfo,
+    types::events::CryptoContextInfo, IdentityStatusChange, RoomIdentityProvider, UserIdentity,
 };
 pub use matrix_sdk_base::store::StoredThreadSubscription;
-use matrix_sdk_base::{
-    ComposerDraft, EncryptionState, RoomInfoNotableUpdateReasons, RoomMemberships, SendOutsideWasm,
-    StateChanges, StateStoreDataKey, StateStoreDataValue,
-    deserialized_responses::{
-        RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
-    },
-    media::{MediaThumbnailSettings, store::IgnoreMediaRetentionPolicy},
-    store::{StateStoreExt, ThreadSubscriptionStatus},
-};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_base::{crypto::RoomEventDecryptionResult, deserialized_responses::EncryptionInfo};
+use matrix_sdk_base::{
+    deserialized_responses::{
+        RawAnySyncOrStrippedState, RawSyncOrStrippedState, SyncOrStrippedState,
+    }, media::{store::IgnoreMediaRetentionPolicy, MediaThumbnailSettings}, store::{StateStoreExt, ThreadSubscriptionStatus}, ComposerDraft, EncryptionState,
+    RoomInfoNotableUpdateReasons, RoomMemberships, SendOutsideWasm,
+    StateChanges,
+    StateStoreDataKey,
+    StateStoreDataValue,
+};
 #[cfg(feature = "e2e-encryption")]
 use matrix_sdk_common::BoxFuture;
 use matrix_sdk_common::{
     deserialized_responses::TimelineEvent,
-    executor::{JoinHandle, spawn},
+    executor::{spawn, JoinHandle},
     timeout::timeout,
 };
 #[cfg(feature = "experimental-search")]
@@ -64,28 +64,28 @@ use matrix_sdk_search::error::IndexError;
 use matrix_sdk_search::index::RoomIndex;
 use mime::Mime;
 use reply::Reply;
+use ruma::api::client::state::get_state_event_for_key::v3::StateEventFormat;
+#[cfg(feature = "unstable-msc4274")]
+use ruma::events::room::message::GalleryItemType;
 #[cfg(any(feature = "experimental-search", feature = "e2e-encryption"))]
 use ruma::events::AnySyncMessageLikeEvent;
 #[cfg(feature = "experimental-encrypted-state-events")]
 use ruma::events::AnySyncStateEvent;
-#[cfg(feature = "unstable-msc4274")]
-use ruma::events::room::message::GalleryItemType;
 #[cfg(feature = "e2e-encryption")]
 use ruma::events::{
-    AnySyncTimelineEvent, SyncMessageLikeEvent, room::encrypted::OriginalSyncRoomEncryptedEvent,
+    room::encrypted::OriginalSyncRoomEncryptedEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
 };
+use ruma::events::{AnyStateEvent, AnySyncStateEvent};
 use ruma::{
-    EventId, Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId, OwnedServerName,
-    OwnedTransactionId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
     api::client::{
         config::{set_global_account_data, set_room_account_data},
         context,
         error::ErrorKind,
         filter::LazyLoadOptions,
         membership::{
-            Invite3pid, ban_user, forget_room, get_member_events,
-            invite_user::{self, v3::InvitationRecipient},
-            kick_user, leave_room, unban_user,
+            ban_user, forget_room, get_member_events, invite_user::{self, v3::InvitationRecipient},
+            kick_user,
+            leave_room, unban_user, Invite3pid,
         },
         message::send_message_event,
         read_marker::set_read_marker,
@@ -96,24 +96,10 @@ use ruma::{
         tag::{create_tag, delete_tag},
         threads::{get_thread_subscription, subscribe_thread, unsubscribe_thread},
         typing::create_typing_event::{self, v3::Typing},
-    },
-    assign,
-    events::{
-        AnyRoomAccountDataEvent, AnyRoomAccountDataEventContent, AnyTimelineEvent, EmptyStateKey,
-        Mentions, MessageLikeEventContent, OriginalSyncStateEvent, RedactContent,
-        RedactedStateEventContent, RoomAccountDataEvent, RoomAccountDataEventContent,
-        RoomAccountDataEventType, StateEventContent, StateEventType, StaticEventContent,
-        StaticStateEventContent, SyncStateEvent,
-        beacon::BeaconEventContent,
-        beacon_info::BeaconInfoEventContent,
-        direct::DirectEventContent,
-        marked_unread::MarkedUnreadEventContent,
-        receipt::{Receipt, ReceiptThread, ReceiptType},
-        room::{
-            ImageInfo, MediaSource, ThumbnailInfo,
-            avatar::{self, RoomAvatarEventContent},
-            encryption::RoomEncryptionEventContent,
-            history_visibility::HistoryVisibility,
+    }, assign, events::{
+        beacon::BeaconEventContent, beacon_info::BeaconInfoEventContent, direct::DirectEventContent, marked_unread::MarkedUnreadEventContent,
+        receipt::{Receipt, ReceiptThread, ReceiptType}, room::{
+            avatar::{self, RoomAvatarEventContent}, encryption::RoomEncryptionEventContent, history_visibility::HistoryVisibility,
             member::{MembershipChange, SyncRoomMemberEvent},
             message::{
                 AudioInfo, AudioMessageEventContent, FileInfo, FileMessageEventContent,
@@ -128,15 +114,31 @@ use ruma::{
             },
             server_acl::RoomServerAclEventContent,
             topic::RoomTopicEventContent,
-        },
-        space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
-        tag::{TagInfo, TagName},
-        typing::SyncTypingEvent,
-    },
-    int,
-    push::{Action, AnyPushRuleRef, PushConditionRoomCtx, Ruleset},
-    serde::Raw,
-    time::Instant,
+            ImageInfo,
+            MediaSource,
+            ThumbnailInfo,
+        }, space::{child::SpaceChildEventContent, parent::SpaceParentEventContent}, tag::{TagInfo, TagName},
+        typing::SyncTypingEvent, AnyRoomAccountDataEvent, AnyRoomAccountDataEventContent,
+        AnyTimelineEvent, EmptyStateKey, Mentions, MessageLikeEventContent,
+        OriginalSyncStateEvent, RedactContent,
+        RedactedStateEventContent,
+        RoomAccountDataEvent,
+        RoomAccountDataEventContent,
+        RoomAccountDataEventType,
+        StateEventContent,
+        StateEventType,
+        StaticEventContent,
+        StaticStateEventContent,
+        SyncStateEvent,
+    }, int, push::{Action, AnyPushRuleRef, PushConditionRoomCtx, Ruleset}, serde::Raw, time::Instant, EventId,
+    Int, MatrixToUri, MatrixUri, MxcUri, OwnedEventId, OwnedRoomId,
+    OwnedServerName,
+    OwnedTransactionId,
+    OwnedUserId,
+    RoomId,
+    TransactionId,
+    UInt,
+    UserId,
 };
 #[cfg(feature = "experimental-encrypted-state-events")]
 use ruma::{
@@ -163,14 +165,7 @@ use crate::event_cache::EventCache;
 #[cfg(feature = "experimental-encrypted-state-events")]
 use crate::room::futures::{SendRawStateEvent, SendStateEvent};
 use crate::{
-    BaseRoom, Client, Error, HttpResult, Result, RoomState, TransmissionProgress,
-    attachment::{AttachmentConfig, AttachmentInfo},
-    client::WeakClient,
-    config::RequestConfig,
-    error::{BeaconError, WrongRoomState},
-    event_cache::{self, EventCacheDropHandles, RoomEventCache},
-    event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent},
-    live_location_share::ObservableLiveLocation,
+    attachment::{AttachmentConfig, AttachmentInfo}, client::WeakClient, config::RequestConfig, error::{BeaconError, WrongRoomState}, event_cache::{self, EventCacheDropHandles, RoomEventCache}, event_handler::{EventHandler, EventHandlerDropGuard, EventHandlerHandle, SyncEvent}, live_location_share::ObservableLiveLocation,
     media::{MediaFormat, MediaRequestParameters},
     notification_settings::{IsEncrypted, IsOneToOne, RoomNotificationMode},
     room::{
@@ -180,6 +175,13 @@ use crate::{
     },
     sync::RoomUpdate,
     utils::{IntoRawMessageLikeEventContent, IntoRawStateEventContent},
+    BaseRoom,
+    Client,
+    Error,
+    HttpResult,
+    Result,
+    RoomState,
+    TransmissionProgress,
 };
 
 pub mod edit;
@@ -972,6 +974,36 @@ impl Room {
             })
             .await
     }
+    ///query any state
+    pub async fn request_state_event(
+        &self,
+        event_type: StateEventType,
+        state_key: impl Into<String>,
+    ) -> Result<Option<Raw<AnyStateEvent>>> {
+        let mut request = get_state_event_for_key::v3::Request::new(
+            self.room_id().to_owned(),
+            event_type,
+            state_key.into(),
+        );
+        request.format = StateEventFormat::Event;
+        let raw_event = match self.client.send(request).await {
+            Ok(res) => res.into_event(),
+            Err(err) => return Err(err.into()),
+        };
+        let json_str = serde_json::json!(raw_event).to_string();
+        debug!("request_state_event raw_event= {json_str}");
+        let sate_event: AnyStateEvent = match raw_event.deserialize() {
+            Ok(ev) => ev,
+            Err(err) => return Err(err.into()),
+        };
+        //强行cast可能会有问题。那就不往state_store存？
+        let _lock = self.client.base_client().state_store_lock().lock().await;
+        let mut changes = StateChanges::default();
+        let sync_event: AnySyncStateEvent = AnySyncStateEvent::from(sate_event);
+        changes.add_state_event(self.room_id(), sync_event, raw_event.clone().cast());
+        self.client.state_store().save_changes(&changes).await?;
+        Ok(Some(raw_event))
+    }
 
     /// Check the encryption state of this room.
     ///
@@ -1212,6 +1244,10 @@ impl Room {
             .get_state_event(self.room_id(), event_type, state_key)
             .await
             .map_err(Into::into)
+    }
+    /// Get all state event in this room.
+    pub async fn get_state_event_all(&self) -> Result<Vec<RawAnySyncOrStrippedState>> {
+        self.client.state_store().get_state_event_all(self.room_id()).await.map_err(Into::into)
     }
 
     /// Get a specific state event of statically-known type with an empty state
@@ -2055,7 +2091,7 @@ impl Room {
     #[allow(unused_variables, unused_mut)]
     async fn enable_encryption_inner(&self, encrypted_state_events: bool) -> Result<()> {
         use ruma::{
-            EventEncryptionAlgorithm, events::room::encryption::RoomEncryptionEventContent,
+            events::room::encryption::RoomEncryptionEventContent, EventEncryptionAlgorithm,
         };
         const SYNC_WAIT_TIME: Duration = Duration::from_secs(3);
 
@@ -4658,24 +4694,23 @@ pub struct RoomMemberWithSenderInfo {
 mod tests {
     use std::collections::BTreeMap;
 
-    use matrix_sdk_base::{ComposerDraft, DraftAttachment, store::ComposerDraftType};
+    use matrix_sdk_base::{store::ComposerDraftType, ComposerDraft, DraftAttachment};
     use matrix_sdk_test::{
-        JoinedRoomBuilder, StateTestEvent, SyncResponseBuilder, async_test,
-        event_factory::EventFactory, test_json,
+        async_test, event_factory::EventFactory, test_json, JoinedRoomBuilder,
+        StateTestEvent, SyncResponseBuilder,
     };
     use ruma::{
-        RoomVersionId, event_id,
-        events::{relation::RelationType, room::member::MembershipState},
-        int, owned_event_id, room_id, user_id,
+        event_id, events::{relation::RelationType, room::member::MembershipState},
+        int,
+        owned_event_id, room_id, user_id, RoomVersionId,
     };
     use wiremock::{
-        Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path_regex},
+        matchers::{header, method, path_regex}, Mock, MockServer,
+        ResponseTemplate,
     };
 
     use super::ReportedContentScore;
     use crate::{
-        Client,
         config::RequestConfig,
         room::messages::{IncludeRelations, ListThreadsOptions, RelationsOptions},
         test_utils::{
@@ -4683,13 +4718,14 @@ mod tests {
             logged_in_client,
             mocks::{MatrixMockServer, RoomRelationsResponseTemplate},
         },
+        Client,
     };
 
     #[cfg(all(feature = "sqlite", feature = "e2e-encryption"))]
     #[async_test]
     async fn test_cache_invalidation_while_encrypt() {
         use matrix_sdk_base::store::RoomLoadSettings;
-        use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, message_like_event_content};
+        use matrix_sdk_test::{message_like_event_content, DEFAULT_TEST_ROOM_ID};
 
         let sqlite_path = std::env::temp_dir().join("cache_invalidation_while_encrypt.db");
         let session = mock_matrix_session();

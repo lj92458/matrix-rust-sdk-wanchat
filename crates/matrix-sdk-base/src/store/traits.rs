@@ -44,7 +44,7 @@ use ruma::{
     time::SystemTime,
 };
 use serde::{Deserialize, Serialize};
-
+use tracing::debug;
 use super::{
     ChildTransactionId, DependentQueuedRequest, DependentQueuedRequestKind, QueueWedgeError,
     QueuedRequest, QueuedRequestKind, RoomLoadSettings, StateChanges, StoreError,
@@ -513,6 +513,13 @@ pub trait StateStore: AsyncTraitDeps {
         room: &RoomId,
         thread_id: &EventId,
     ) -> Result<Option<StoredThreadSubscription>, Self::Error>;
+
+
+    /// Loads all the current state for a given room.
+    async fn get_state_event_all(
+        &self,
+        room_id: &RoomId
+    ) -> Result<Vec<RawAnySyncOrStrippedState>, Self::Error>;
 }
 
 #[repr(transparent)]
@@ -831,6 +838,11 @@ impl<T: StateStore> StateStore for EraseStateStoreError<T> {
         thread_id: &EventId,
     ) -> Result<(), Self::Error> {
         self.0.remove_thread_subscription(room, thread_id).await.map_err(Into::into)
+    }
+
+    async fn get_state_event_all(&self, room_id: &RoomId) -> Result<Vec<RawAnySyncOrStrippedState>, Self::Error> {
+        debug!("get_state_event_all EraseState");
+        self.0.get_state_event_all(room_id).await.map_err(Into::into)
     }
 }
 

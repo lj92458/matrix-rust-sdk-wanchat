@@ -1,42 +1,5 @@
 use std::{collections::HashMap, fs, path::PathBuf, pin::pin, sync::Arc};
 
-use anyhow::{Context, Result};
-use futures_util::{pin_mut, StreamExt};
-use matrix_sdk::{
-    encryption::LocalTrust,
-    room::{
-        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
-        TryFromReportedContentScoreError,
-    },
-    send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
-    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
-    DraftAttachment as SdkDraftAttachment, DraftAttachmentContent, DraftThumbnail, EncryptionState,
-    PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
-    SuccessorRoom as SdkSuccessorRoom,
-};
-use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
-use matrix_sdk_ui::{
-    timeline::{default_event_filter, RoomExt, TimelineBuilder},
-    unable_to_decrypt_hook::UtdHookManager,
-};
-use mime::Mime;
-use ruma::{
-    assign,
-    events::{
-        receipt::ReceiptThread,
-        room::{
-            avatar::ImageInfo as RumaAvatarImageInfo,
-            history_visibility::HistoryVisibility as RumaHistoryVisibility,
-            join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
-            MediaSource as RumaMediaSource,
-        },
-        AnyMessageLikeEventContent, AnySyncTimelineEvent,
-    },
-    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
-    ServerName, UserId,
-};
-use tracing::{error, warn};
-
 use self::{power_levels::RoomPowerLevels, room_info::RoomInfo};
 use crate::{
     chunk_iterator::ChunkIterator,
@@ -59,6 +22,49 @@ use crate::{
     utils::{u64_to_uint, AsyncRuntimeDropped},
     TaskHandle,
 };
+use anyhow::{Context, Result};
+use futures_util::{pin_mut, StreamExt};
+use matrix_sdk::custom_state_subscriber::GlobalCustomStateSubscriber;
+use matrix_sdk::{
+    custom_state_subscriber::SubscriberListener,
+    encryption::LocalTrust,
+    room::{
+        edit::EditedContent, power_levels::RoomPowerLevelChanges, Room as SdkRoom, RoomMemberRole,
+        TryFromReportedContentScoreError,
+    },
+    send_queue::RoomSendQueueUpdate as SdkRoomSendQueueUpdate,
+    ComposerDraft as SdkComposerDraft, ComposerDraftType as SdkComposerDraftType,
+    DraftAttachment as SdkDraftAttachment, DraftAttachmentContent, DraftThumbnail, EncryptionState,
+    PredecessorRoom as SdkPredecessorRoom, RoomHero as SdkRoomHero, RoomMemberships, RoomState,
+    SuccessorRoom as SdkSuccessorRoom,
+};
+use matrix_sdk_common::deserialized_responses::TimelineEventKind;
+use matrix_sdk_common::deserialized_responses::DecryptedRoomEvent;
+use matrix_sdk_common::{SendOutsideWasm, SyncOutsideWasm};
+use matrix_sdk_ui::{
+    timeline::{default_event_filter, RoomExt, TimelineBuilder},
+    unable_to_decrypt_hook::UtdHookManager,
+};
+use mime::Mime;
+use ruma::events::{AnySyncStateEvent, StateEventType};
+use ruma::serde::Raw;
+use ruma::{
+    assign,
+    events::{
+        receipt::ReceiptThread,
+        room::{
+            avatar::ImageInfo as RumaAvatarImageInfo,
+            history_visibility::HistoryVisibility as RumaHistoryVisibility,
+            join_rules::JoinRule as RumaJoinRule, message::RoomMessageEventContentWithoutRelation,
+            MediaSource as RumaMediaSource,
+        },
+        AnyMessageLikeEventContent, AnySyncTimelineEvent,
+    },
+    EventId, Int, OwnedDeviceId, OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId,
+    RoomId, ServerName, UserId,
+};
+use serde::Serialize;
+use tracing::{error, debug, info, warn};
 
 mod power_levels;
 pub mod room_info;
@@ -387,6 +393,84 @@ impl Room {
             }
         })))
     }
+    /// 从本地state_store查询状态，如果没有，就去服务器查，查到了就存到本地。如果服务器也没有，就返回空值。
+    pub async fn get_custom_state(
+        self: Arc<Self>,
+        room_id: String,
+        event_types: Vec<String>,
+    ) -> Result<String, ClientError> {
+        // 解析房间 ID
+        let room_id = RoomId::parse(&room_id).map_err(|e| ClientError::Generic {
+            msg: format!("Invalid room_id: {room_id}"),
+            details: Some(format!("{e:?}")),
+        })?;
+
+        // 获取房间对象
+        let room = self.inner.client().get_room(&room_id)
+            .ok_or_else(|| ClientError::Generic {
+                msg: format!("Room not found: {room_id}"),
+                details: None,
+            })?;
+
+        let mut batch = Vec::with_capacity(event_types.len());
+
+        for et in event_types {
+            let ty = StateEventType::from(et.as_str());
+
+            // 尝试从本地获取
+            let json_value = match room.get_state_event(ty.clone(), "").await {
+                Ok(Some(raw)) => Some(serde_json::json!(raw)),
+                Ok(None) => {
+                    // 本地没有，去服务器查
+                    match room.request_state_event(ty.clone(), "").await {
+                        Ok(Some(raw_event)) => Some(serde_json::json!(raw_event)),
+                        Ok(None) => None, // 服务器也没有，跳过
+                        Err(e) => {
+                            error!("Failed to request state event {et}: {e:?}");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to get local state event {et}: {e:?}");
+                    None
+                }
+            };
+
+            if let Some(json_value) = json_value {
+                batch.push(json_value);
+            }
+        }
+
+        serde_json::to_string(&batch).map_err(|e| ClientError::Generic {
+            msg: "Failed to serialize state batch".into(),
+            details: Some(format!("{e:?}")),
+        })
+    }
+
+
+    pub fn subscribe_custom_state_updates(
+        self: &Self,
+        room_id: String,
+        event_types: Vec<String>,
+        listener: Box<dyn CustomStateListener>,
+    ) -> Arc<TaskHandle> {
+        let id = match RoomId::parse(&room_id) {
+            Ok(id) => id,
+            Err(_) => {
+                // 返回一个空任务，以免崩溃
+                return Arc::new(TaskHandle::new(get_runtime_handle().spawn(async {})));
+            }
+        };
+        let adapter = Arc::new(FfiListenerAdapter { inner: listener });
+        Arc::new(TaskHandle::new(get_runtime_handle().spawn(async move {
+            GlobalCustomStateSubscriber::instance().subscribe_room(
+                id.to_string(),
+                event_types,
+                adapter.clone(),
+            );
+        })))
+    }
 
     pub async fn set_is_favourite(
         &self,
@@ -430,14 +514,29 @@ impl Room {
         event_type: &str,
         state_key: &str,
         content: String,
-    ) -> Result<(), ClientError> {
+    ) -> Result<String, ClientError> {
         let content_json: serde_json::Value =
             serde_json::from_str(&content).map_err(|e| ClientError::Generic {
                 msg: format!("Failed to parse JSON: {e}"),
                 details: Some(format!("{e:?}")),
             })?;
-        self.inner.send_state_event_raw(event_type, state_key, content_json).await?;
-        Ok(())
+        let resp = self.inner.send_state_event_raw(event_type, state_key, content_json).await?;
+        debug!("send_state_event_raw: {content:?}");
+        //调用event_handler
+        let event = match self.inner.load_or_fetch_event(&*resp.event_id, None).await {
+            Ok(event) => event,
+            Err(err) => return Err(err.into()),
+        };
+        let raw = match event.kind {
+            TimelineEventKind::Decrypted(ref decrypted_event) => decrypted_event.event.clone().cast(),
+            TimelineEventKind::PlainText { ref event } => event.clone(),
+            TimelineEventKind::UnableToDecrypt { ref event, .. } => event.clone(),
+        };
+        let raw_state_event: Raw<AnySyncStateEvent> = Raw::from_json(raw.json().to_owned());
+
+        GlobalCustomStateSubscriber::instance().handle_sync_state_event(raw_state_event, self.inner.clone()).await;
+        //
+        Ok(resp.event_id.to_string())
     }
 
     /// Redacts an event from the room.
@@ -1380,6 +1479,19 @@ pub fn matrix_to_room_alias_permalink(
 #[matrix_sdk_ffi_macros::export(callback_interface)]
 pub trait RoomInfoListener: SyncOutsideWasm + SendOutsideWasm {
     fn call(&self, room_info: RoomInfo);
+}
+#[matrix_sdk_ffi_macros::export(callback_interface)]
+pub trait CustomStateListener: SyncOutsideWasm + SendOutsideWasm {
+    fn call(&self, event_json_arr: String);
+}
+pub struct FfiListenerAdapter {
+    inner: Box<dyn CustomStateListener>,
+}
+
+impl SubscriberListener for FfiListenerAdapter {
+    fn call(&self, event_json: String) {
+        self.inner.call(event_json);
+    }
 }
 
 #[matrix_sdk_ffi_macros::export(callback_interface)]

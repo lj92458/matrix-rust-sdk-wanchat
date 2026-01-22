@@ -116,6 +116,7 @@ use crate::{
     cross_process_lock::CrossProcessLock,
     encryption::{Encryption, EncryptionData, EncryptionSettings, VerificationState},
 };
+use crate::custom_state_subscriber::GlobalCustomStateSubscriber;
 
 mod builder;
 pub(crate) mod caches;
@@ -486,7 +487,10 @@ impl Client {
     ///
     /// * `homeserver_url` - The homeserver that the client should connect to.
     pub async fn new(homeserver_url: Url) -> Result<Self, ClientBuildError> {
-        Self::builder().homeserver_url(homeserver_url).build().await
+        let client = Self::builder().homeserver_url(homeserver_url).build().await?;
+        // 初始化订阅模块。
+        GlobalCustomStateSubscriber::init_and_register(Arc::new(client.clone()));
+        Ok(client)
     }
 
     /// Returns a subscriber that publishes an event every time the ignore user

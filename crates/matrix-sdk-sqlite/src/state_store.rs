@@ -43,7 +43,7 @@ use tokio::{
     fs,
     sync::{Mutex, OwnedMutexGuard},
 };
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     error::{Error, Result},
@@ -876,6 +876,19 @@ trait SqliteObjectStateStoreExt: SqliteAsyncConnExt {
         })
         .await
     }
+    async fn get_maybe_stripped_state_events_all(&self, room_id: Key) -> Result<Vec<(bool, Vec<u8>)>> {
+        debug!("get_maybe_stripped_state_events_all");
+        self.chunk_large_query_over(Vec::<Key>::new(), None, move |txn, _state_keys: Vec<Key>| {
+            let sql = "SELECT stripped, data FROM state_event WHERE room_id = ?";
+            let mut stmt = txn.prepare(sql)?;
+            let rows = stmt
+                .query_map([room_id.clone()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            debug!("get_maybe_stripped_state_events_all chunk_large_query_over");
+            Ok(rows)
+        }).await
+
+    }
 
     async fn get_maybe_stripped_state_events(
         &self,
@@ -1542,6 +1555,27 @@ impl StateStore for SqliteStateStore {
                     RawAnySyncOrStrippedState::Sync(self.deserialize_json(&data)?)
                 };
 
+                Ok(ev)
+            })
+            .collect()
+    }
+    async fn get_state_event_all(
+        &self,
+        room_id: &RoomId
+    ) -> std::result::Result<Vec<RawAnySyncOrStrippedState>, Self::Error> {
+        debug!("get_state_event_all state_store");
+        let room_id = self.encode_key(keys::STATE_EVENT, room_id);
+        self.read()
+            .await?
+            .get_maybe_stripped_state_events_all(room_id)
+            .await?
+            .into_iter()
+            .map(|(stripped, data)| {
+                let ev = if stripped {
+                    RawAnySyncOrStrippedState::Stripped(self.deserialize_json(&data)?)
+                } else {
+                    RawAnySyncOrStrippedState::Sync(self.deserialize_json(&data)?)
+                };
                 Ok(ev)
             })
             .collect()

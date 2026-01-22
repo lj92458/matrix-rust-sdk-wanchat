@@ -76,6 +76,7 @@ experimental-search = ["matrix-sdk-search"]
 experimental-element-recent-emojis = ["matrix-sdk-base/experimental-element-recent-emojis"]
 
 [dependencies]
+dashmap = "6.1.0"
 anyhow = { workspace = true, optional = true }
 anymap2 = "0.13.0"
 aquamarine.workspace = true

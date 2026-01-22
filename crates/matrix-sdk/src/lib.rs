@@ -101,3 +101,6 @@ pub mod test_utils;
 
 #[cfg(test)]
 matrix_sdk_test_utils::init_tracing_for_tests!();
+
+/// 自定义房间状态订阅
+pub mod custom_state_subscriber;
